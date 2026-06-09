@@ -1,0 +1,11 @@
+[package]
+name = "tls-handshake-benchmarking"
+version = "0.1.0"
+edition = "2021"
+description = "Per-message TLS handshake timing benchmark for s2n-tls vs Rustls"
+
+[dependencies]
+s2n-tls = { path = "../s2n-tls/bindings/rust/extended/s2n-tls" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
