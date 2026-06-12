@@ -14,6 +14,10 @@
 
 use std::{collections::BTreeMap, sync::Mutex, time::Instant};
 
+use rcgen::{
+    CertificateParams, KeyPair, RsaKeySize, SignatureAlgorithm, PKCS_ECDSA_P256_SHA256,
+    PKCS_ECDSA_P384_SHA384, PKCS_RSA_SHA256,
+};
 use serde::Serialize;
 
 use s2n_tls::{
@@ -62,9 +66,11 @@ struct OutputFile {
 }
 
 const HANDSHAKE_ORDER: &[&str] = &[
-    // used for sorted printing of the summary table
     "CLIENT_HELLO",
+    "RECORD_READ",
+    "RECORD_WRITE",
     "SERVER_HELLO",
+    "SERVER_CHANGE_CIPHER_SPEC",
     "ENCRYPTED_EXTENSIONS",
     "SERVER_CERT_REQ",
     "SERVER_CERT",
@@ -72,9 +78,9 @@ const HANDSHAKE_ORDER: &[&str] = &[
     "SERVER_FINISHED",
     "CLIENT_CERT",
     "CLIENT_CERT_VERIFY",
-    "CLIENT_FINISHED",
     "CLIENT_CHANGE_CIPHER_SPEC",
-    "SERVER_CHANGE_CIPHER_SPEC",
+    "CLIENT_FINISHED",
+    "NEGOTIATE_END",
 ];
 
 // ============================================================================
@@ -123,21 +129,19 @@ impl EventSubscriber for TimingSubscriber {
 
 /// Convert a raw checkpoint buffer into per-message duration records.
 ///
-/// Walks the buffer, groups by (iteration, role), sorts each group by
-/// timestamp, and emits one record per consecutive pair. The duration of
-/// message N is `checkpoint[N].timestamp - checkpoint[N-1].timestamp`. The
-/// first checkpoint in each group (typically `NEGOTIATE_START`) is the
-/// anchor and does not produce a duration record itself.
+/// Uses the global timeline: all checkpoints are sorted by timestamp, and
+/// each message's duration is the delta from the immediately preceding
+/// checkpoint (regardless of role). This correctly handles single-threaded
+/// cooperative I/O where one side's work happens between the other side's
+/// checkpoints.
+///
+/// The first checkpoint per iteration (`NEGOTIATE_START`) is an anchor and
+/// does not produce a duration record.
 fn compute_durations(checkpoints: &[RawCheckpoint], iterations: u64) -> Vec<MeasurementRecord> {
     if checkpoints.is_empty() || iterations == 0 {
         return Vec::new();
     }
 
-    // We don't track iteration index directly in the checkpoint, so we infer
-    // it: each handshake fires the same number of checkpoints, so we split
-    // the buffer evenly. Both server and client produce checkpoints during
-    // a single handshake (TestPair drives both sides in process), so the
-    // total per handshake is server_count + client_count.
     let total = checkpoints.len() as u64;
     let per_handshake = total.checked_div(iterations).unwrap_or(0);
     if per_handshake == 0 {
@@ -148,28 +152,31 @@ fn compute_durations(checkpoints: &[RawCheckpoint], iterations: u64) -> Vec<Meas
     for (idx, ckpt_chunk) in checkpoints.chunks(per_handshake as usize).enumerate() {
         let iteration = idx as u64;
 
-        // Split server-side and client-side checkpoints; sort each by timestamp.
-        let mut server_ckpts: Vec<&RawCheckpoint> =
-            ckpt_chunk.iter().filter(|c| c.role == "server").collect();
-        let mut client_ckpts: Vec<&RawCheckpoint> =
-            ckpt_chunk.iter().filter(|c| c.role == "client").collect();
-        server_ckpts.sort_by_key(|c| c.timestamp_ns);
-        client_ckpts.sort_by_key(|c| c.timestamp_ns);
+        // Sort all checkpoints in this iteration by timestamp (global timeline).
+        let mut sorted: Vec<&RawCheckpoint> = ckpt_chunk.iter().collect();
+        sorted.sort_by_key(|c| c.timestamp_ns);
 
-        for group in &[&server_ckpts, &client_ckpts] {
-            for window in group.windows(2) {
-                let prev = window[0];
-                let curr = window[1];
-                let duration_ns = curr.timestamp_ns.saturating_sub(prev.timestamp_ns);
-                records.push(MeasurementRecord {
-                    implementation: "s2n-tls".to_string(),
-                    handshake_type: "tls13_full".to_string(),
-                    iteration,
-                    message_name: curr.name.clone(),
-                    role: curr.role.clone(),
-                    duration_ns,
-                });
+        // Walk the global timeline. Each message's duration is the delta from
+        // the immediately preceding checkpoint, regardless of which side it
+        // came from. This means cross-side handoff time is not inflated.
+        for window in sorted.windows(2) {
+            let prev = window[0];
+            let curr = window[1];
+
+            // Skip NEGOTIATE_START — it's only an anchor.
+            if curr.name == "NEGOTIATE_START" {
+                continue;
             }
+
+            let duration_ns = curr.timestamp_ns.saturating_sub(prev.timestamp_ns);
+            records.push(MeasurementRecord {
+                implementation: "s2n-tls".to_string(),
+                handshake_type: "tls13_full".to_string(),
+                iteration,
+                message_name: curr.name.clone(),
+                role: curr.role.clone(),
+                duration_ns,
+            });
         }
     }
     records
@@ -208,6 +215,68 @@ impl VerifyHostNameCallback for InsecureAcceptAllCertificatesHandler {
 }
 
 // ============================================================================
+// Certificate generation
+// ============================================================================
+
+/// Generate a CA certificate and a server certificate signed by it, using the
+/// requested algorithm/key size. Returns (ca_pem, cert_chain_pem, key_pem) as
+/// byte vectors ready to pass to s2n-tls.
+fn generate_certs(sig_type: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let alg: &'static SignatureAlgorithm = match sig_type {
+        "rsa2048" | "rsa3072" | "rsa4096" => &PKCS_RSA_SHA256,
+        "ecdsa256" => &PKCS_ECDSA_P256_SHA256,
+        "ecdsa384" => &PKCS_ECDSA_P384_SHA384,
+        _ => &PKCS_RSA_SHA256,
+    };
+
+    let rsa_key_size: Option<RsaKeySize> = match sig_type {
+        "rsa2048" => Some(RsaKeySize::_2048),
+        "rsa3072" => Some(RsaKeySize::_3072),
+        "rsa4096" => Some(RsaKeySize::_4096),
+        _ => None,
+    };
+
+    // Generate CA key pair
+    let ca_key = if let Some(size) = rsa_key_size {
+        KeyPair::generate_rsa_for(alg, size).expect("failed to generate CA RSA key")
+    } else {
+        KeyPair::generate_for(alg).expect("failed to generate CA key")
+    };
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Benchmark CA");
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    // Generate server key pair
+    let server_key = if let Some(size) = rsa_key_size {
+        KeyPair::generate_rsa_for(alg, size).expect("failed to generate server RSA key")
+    } else {
+        KeyPair::generate_for(alg).expect("failed to generate server key")
+    };
+
+    let mut server_params =
+        CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    // Build the chain: server cert + CA cert
+    let cert_chain_pem = format!("{}{}", server_cert.pem(), ca_cert.pem());
+
+    (
+        ca_cert.pem().into_bytes(),
+        cert_chain_pem.into_bytes(),
+        server_key.serialize_pem().into_bytes(),
+    )
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -220,12 +289,8 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "results.json".to_string());
 
-    let cert_dir = match sig_type.as_str() {
-        "rsa2048" => "rsae_pkcs_2048_sha256",
-        "rsa3072" => "rsae_pkcs_3072_sha384",
-        "rsa4096" => "rsae_pkcs_4096_sha384",
-        "ecdsa256" => "ec_ecdsa_p256_sha256",
-        "ecdsa384" => "ec_ecdsa_p384_sha384",
+    match sig_type.as_str() {
+        "rsa2048" | "rsa3072" | "rsa4096" | "ecdsa256" | "ecdsa384" => {}
         other => {
             eprintln!("Unknown: {other}. Use: rsa2048|rsa3072|rsa4096|ecdsa256|ecdsa384");
             std::process::exit(1);
@@ -240,13 +305,8 @@ fn main() {
     println!("Cert: {sig_type}, Warmup iterations: {warmup}, Measurement iterations: {measure}");
     println!("Output: {output_path}");
 
-    let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../..");
-    let cert_path = format!("{repo_root}/tests/pems/permutations/{cert_dir}/server-chain.pem");
-    let key_path = format!("{repo_root}/tests/pems/permutations/{cert_dir}/server-key.pem");
-    let ca_path = format!("{repo_root}/tests/pems/permutations/{cert_dir}/ca-cert.pem");
-    let cert_pem = std::fs::read(&cert_path).unwrap_or_else(|_| panic!("Cannot read {cert_path}"));
-    let key_pem = std::fs::read(&key_path).unwrap_or_else(|_| panic!("Cannot read {key_path}"));
-    let ca_pem = std::fs::read(&ca_path).unwrap_or_else(|_| panic!("Cannot read {ca_path}"));
+    // Generate CA and server certs at runtime using rcgen.
+    let (ca_pem, cert_pem, key_pem) = generate_certs(&sig_type);
 
     struct AcceptLocalhost;
     impl s2n_tls::callbacks::VerifyHostNameCallback for AcceptLocalhost {
