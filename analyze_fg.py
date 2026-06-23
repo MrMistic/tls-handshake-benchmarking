@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """
-Operation-level analysis of handshake flamegraphs.
+Operation-level analysis of handshake flamegraphs (LEAF-attributed).
 
-Reads collapsed-stack files (from stackcollapse-perf.pl), buckets samples into
-crypto/protocol operations, and converts CPU shares into absolute
-microseconds-per-handshake using each implementation's measured hot-loop mean
-(Option 1 from the methodology doc — NOT raw perf wall time).
+⚠️  ACCURACY NOTE — READ THIS:
+    This script reads collapsed FRAME-POINTER stacks. Frame-pointer unwinding
+    breaks through hand-written crypto assembly (aws-lc), producing broken call
+    chains. An EARLIER version of this script bucketed a sample if ANY frame in
+    its (possibly broken) stack matched — which badly MISATTRIBUTED small
+    buckets (e.g. it once reported HKDF at ~37us and cert-validate at ~25us when
+    the DWARF-verified self-time values were ~5us and ~10us). Those were
+    artifacts of stale frames in broken stacks.
+
+    This version attributes each sample to its LEAF frame only (the innermost
+    function = where the instruction pointer actually landed), which is
+    unwinding-independent and far more robust. It still uses FP captures, so:
+
+    >>> For the AUTHORITATIVE operation breakdown, use analyze_selftime.py,
+    >>> which parses `perf report --sort symbol` SELF time from a DWARF capture.
+    >>> Treat this script's output as an approximation; verify any sub-2%
+    >>> bucket against analyze_selftime.py before citing absolute numbers.
+
+Converts leaf shares into absolute microseconds-per-handshake using each
+implementation's measured hot-loop mean (share x mean).
 
 Usage:
     python3 analyze_fg.py \
@@ -15,35 +31,30 @@ Usage:
 import argparse
 import re
 
-# Operation buckets. Each sample is attributed to the FIRST matching bucket,
-# based on substrings appearing anywhere in its stack. Order matters: more
-# specific patterns first.
-BUCKETS = [
-    ("RSA sign",          [r"rsa.*sign", r"BN_mod_exp", r"rsa_blinding", r"RSA_sign", r"_rsa_.*priv", r"rsa.*private"]),
-    ("RSA verify",        [r"rsa.*verify", r"RSA_verify", r"pkcs1.*verify", r"rsa.*public"]),
-    # Bignum modular arithmetic — the core of RSA modexp. These symbols don't
-    # contain "rsa" but are dominated by RSA private-key work in a handshake
-    # (verified: bn_sqrx8x_internal is the single largest symbol in both libs).
-    ("RSA (bignum modexp)",[r"\brsa", r"bn_mul", r"BN_mod", r"montgomery", r"\bmont\b",
-                            r"bn_sqr", r"bn_sqrx", r"bn_postx", r"\bmulx\d", r"sqrx8x", r"sqr8x"]),
-    # EC field arithmetic (P-256/P-384) used by ECDSA + ECDHE.
-    ("ECDSA/EC",          [r"ecdsa", r"EC_POINT", r"ec_GFp", r"\bp256", r"\bp384",
-                            r"ecp_nistz", r"nistz256", r"montinv_p256", r"montinv_p384"]),
-    ("X25519/ECDHE",      [r"25519", r"curve25519", r"\becdh"]),
-    ("ML-KEM/PQ",         [r"kyber", r"mlkem", r"ml_kem", r"pqcrystals"]),
-    ("Cert/X509 validate",[r"x509", r"asn1", r"\bder_", r"webpki", r"verify_cert", r"cert.*chain", r"parse.*cert"]),
-    ("HKDF/key schedule", [r"hkdf", r"hmac", r"key_schedule", r"derive.*traffic", r"expand_label", r"\bprf\b"]),
-    # Tightened: require digit/format context so "handshake", "SharedSecret" don't match.
-    ("SHA/hash",          [r"sha256", r"sha512", r"sha384", r"sha1\b", r"sha3", r"sha1_block",
-                           r"md5_block", r"md5", r"_md_", r"digest"]),
-    ("AES/GCM/AEAD",      [r"\baes", r"_aes", r"\bgcm", r"aead", r"chacha", r"poly1305"]),
-    # s2n-specific buffer/blob management layer (no rustls equivalent of
-    # comparable cost). Named explicitly so it isn't hidden in "other".
-    ("Buffer mgmt (s2n stuffer/blob)", [r"s2n_stuffer", r"s2n_blob", r"s2n_record_", r"s2n_array"]),
-    ("RNG",               [r"rdrand", r"rand_bytes", r"CRYPTO_.*rand", r"drbg"]),
-    ("alloc/memory",      [r"malloc", r"\bfree\b", r"alloc", r"memcpy", r"memset", r"memmove",
-                           r"OPENSSL_free", r"drop_in_place"]),
-]
+# Reuse the SAME bucket patterns as analyze_selftime.py — they are written for
+# leaf-symbol (instruction-pointer) matching, e.g. RSA modexp asm like
+# `rsaz_amm52x20_x2_ifma256` which doesn't contain "rsa". Importing keeps the
+# two tools consistent; analyze_selftime.py remains the authoritative source.
+try:
+    from analyze_selftime import BUCKETS
+except ImportError:
+    # Fallback if run from a different cwd: minimal inline copy.
+    BUCKETS = [
+        ("RSA modexp/bignum", [r"rsaz_amm", r"bn_sqrx", r"bn_sqr8x", r"bn_mulx", r"bn_mul",
+                               r"mulx4x", r"extract_multiplier", r"bn_mod_exp", r"bn_from_montgomery",
+                               r"bn_mont", r"rsa_", r"\brsa\b", r"mod_exp"]),
+        ("ECDSA/EC P-256",    [r"ecp_nistz", r"nistz256", r"\bp256", r"ecdsa", r"bignum_montinv_p256"]),
+        ("X25519/ECDHE",      [r"25519", r"curve25519", r"x25519"]),
+        ("ML-KEM (Keccak/SHA3)", [r"keccak", r"sha3", r"kyber", r"mlkem", r"ml_kem"]),
+        ("SHA-2 hashing",     [r"sha256_block", r"sha512_block", r"sha1_block", r"sha256", r"sha512", r"md5_block"]),
+        ("HKDF/key schedule", [r"hkdf", r"hmac", r"secrets_update", r"key_schedule", r"derive", r"expand_label", r"tls13_"]),
+        ("AES/GCM/AEAD",      [r"aes", r"gcm", r"aead", r"chacha", r"poly1305", r"ghash"]),
+        ("Cert/X509 validate",[r"x509", r"asn1", r"\bcbs_", r"parse_asn1", r"cache_extensions",
+                               r"verify_cert", r"name_constraints", r"name_canon", r"\bder_", r"webpki"]),
+        ("Buffer mgmt (s2n stuffer/blob)", [r"s2n_stuffer", r"s2n_blob", r"s2n_record_"]),
+        ("RNG",               [r"rdrand", r"rand_bytes", r"drbg", r"ctr_drbg"]),
+        ("alloc/memory",      [r"malloc", r"\bfree\b", r"cfree", r"alloc", r"memcpy", r"memset", r"memmove", r"OPENSSL_free", r"OPENSSL_malloc"]),
+    ]
 
 
 def load(path):
@@ -65,13 +76,21 @@ def load(path):
 
 
 def bucketize(rows):
+    """Attribute each sample to a bucket by its LEAF frame (innermost function).
+
+    Matching the leaf only — rather than 'any frame in the stack' — makes this
+    robust to broken frame-pointer call chains: a sample is counted as cert/RSA/
+    etc. based on where the instruction pointer actually landed, not on whatever
+    stale frames happen to be above it in a mis-unwound stack.
+    """
     counts = {name: 0 for name, _ in BUCKETS}
     counts["other"] = 0
     pats = [(name, [re.compile(p, re.IGNORECASE) for p in pl]) for name, pl in BUCKETS]
     for stack, cnt in rows:
+        leaf = stack.rsplit(";", 1)[-1]  # innermost frame only
         matched = None
         for name, plist in pats:
-            if any(p.search(stack) for p in plist):
+            if any(p.search(leaf) for p in plist):
                 matched = name
                 break
         counts[matched if matched else "other"] += cnt
@@ -142,6 +161,12 @@ def main():
     ap.add_argument("--cert-type", default="rsa2048")
     ap.add_argument("--chart", help="path to write the operation-level comparison PNG")
     args = ap.parse_args()
+
+    print("=" * 72)
+    print("NOTE: FP-stack approximation (leaf-attributed). For authoritative")
+    print("      numbers use analyze_selftime.py (DWARF self-time). Verify any")
+    print("      sub-2% bucket there before citing absolute values.")
+    print("=" * 72)
 
     s2n = report("s2n-tls", args.s2n, args.s2n_mean)
     rustls = report("rustls", args.rustls, args.rustls_mean)

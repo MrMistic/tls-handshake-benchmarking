@@ -15,3 +15,7 @@ perf.data*
 *.data.old
 folded_*.txt
 hotloop_mean_*.txt
+
+# Python
+__pycache__/
+*.pyc
