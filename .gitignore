@@ -7,6 +7,12 @@ handoff.md
 # Analysis/methodology working docs (kept local, not committed)
 OPERATION_LEVEL_RESULTS.md
 OPERATION_TIMING_METHODOLOGY.md
+RUSTLS_ANNOTATION_WALKTHROUGH.md
+WHY_NOT_1TO1.md
+S2N_FIX_CANDIDATES.md
+
+# Charts (all versions, regenerable)
+charts*/
 
 # Flamegraph profiling artifacts (regenerable via --flamegraph / --compare)
 *.svg

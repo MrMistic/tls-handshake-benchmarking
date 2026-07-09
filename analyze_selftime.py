@@ -68,25 +68,70 @@ def bucketize(rows):
     return counts
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--report", required=True)
-    ap.add_argument("--mean", type=float, required=True, help="hot-loop mean handshake us")
-    ap.add_argument("--label", default="impl")
-    args = ap.parse_args()
-
-    rows = parse_report(args.report)
+def report_counts(report, mean, label):
+    rows = parse_report(report)
     counts = bucketize(rows)
     accounted = sum(counts.values())
-    print(f"\n=== {args.label} (DWARF self-time; mean {args.mean:.1f} us) ===")
+    print(f"\n=== {label} (DWARF self-time; mean {mean:.1f} us) ===")
     print(f"  {'Operation':<28} {'self%':>7} {'us/handshake':>13}")
     print(f"  {'-'*28} {'-'*7} {'-'*13}")
     for name in [b[0] for b in BUCKETS] + ["other"]:
         pct = counts[name]
         if pct <= 0:
             continue
-        print(f"  {name:<28} {pct:6.1f}% {pct/100*args.mean:11.1f}")
+        print(f"  {name:<28} {pct:6.1f}% {pct/100*mean:11.1f}")
     print(f"  (accounted: {accounted:.1f}% of self-time samples)")
+    return {name: counts[name] / 100 * mean for name, _ in BUCKETS}, counts["other"] / 100 * mean
+
+
+def make_chart(s2n_us, rustls_us, cert_type, out_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    names = [b[0] for b in BUCKETS] + ["other"]
+    names = [n for n in names if s2n_us.get(n, 0) > 0.05 or rustls_us.get(n, 0) > 0.05]
+    s = [s2n_us.get(n, 0) for n in names]
+    r = [rustls_us.get(n, 0) for n in names]
+    y = np.arange(len(names))
+    h = 0.38
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.barh(y - h / 2, s, h, label="s2n-tls", color="#4682b4", edgecolor="black", linewidth=0.4)
+    ax.barh(y + h / 2, r, h, label="rustls", color="#e68c3c", edgecolor="black", linewidth=0.4)
+    ax.set_yticks(y)
+    ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.set_xlabel("µs per handshake (DWARF self-time × hot-loop mean)")
+    ax.set_title(f"Operation-level comparison — {cert_type}\nDWARF self-time (authoritative)")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\n  ✓ wrote {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--report", required=True)
+    ap.add_argument("--mean", type=float, required=True, help="hot-loop mean handshake us")
+    ap.add_argument("--label", default="impl")
+    # Optional second implementation + chart (produces the comparison PNG).
+    ap.add_argument("--report2", help="second implementation's report (for comparison chart)")
+    ap.add_argument("--mean2", type=float, help="second implementation's mean us")
+    ap.add_argument("--label2", default="rustls")
+    ap.add_argument("--cert-type", default="rsa2048")
+    ap.add_argument("--chart", help="path to write the comparison PNG")
+    args = ap.parse_args()
+
+    us1, other1 = report_counts(args.report, args.mean, args.label)
+    us1["other"] = other1
+
+    if args.report2 and args.mean2:
+        us2, other2 = report_counts(args.report2, args.mean2, args.label2)
+        us2["other"] = other2
+        if args.chart:
+            make_chart(us1, us2, args.cert_type, args.chart)
 
 
 if __name__ == "__main__":

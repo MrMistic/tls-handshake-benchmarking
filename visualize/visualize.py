@@ -182,38 +182,114 @@ def _ordered_segments(rows):
 
 
 def make_timeline_chart(data: dict, impl: str, output_dir: Path):
-    """Per-implementation single-row chronological timeline."""
+    """Timeline chart: plots each checkpoint at its absolute wall-clock position.
+
+    Shows the true chronological interleaving of client and server checkpoints
+    on a shared time axis (T=0 at the start of the handshake). Each checkpoint
+    is a vertical marker at its wall_ns position, color-coded by role.
+    """
     meta = data["metadata"]
     rows = measurements_for(data, impl)
-    ordered, means, _ = _ordered_segments(rows)
-    if not ordered:
+    if not rows:
         return
 
-    total_ns = sum(means[k] for k in ordered)
-    fig, ax = plt.subplots(figsize=(18, 3))
+    # Use MEAN wall_ns positions (averaged over all iterations) for consistency
+    # with the END marker which is also a mean. Plotting a single iteration's
+    # positions against a mean END line causes misalignment.
+    iter0 = [m for m in rows if m.get("wall_ns", 0) > 0]
+    if not iter0:
+        return
+
+    # Compute mean wall_ns per (message_name, role, direction).
+    wall_map = defaultdict(list)
+    for m in iter0:
+        key = (m["message_name"], m["role"], m.get("direction", "read"))
+        wall_map[key].append(m["wall_ns"])
+
+    # Use iteration 0's order for the sequence.
+    iter0_only = sorted(
+        [m for m in rows if m["iteration"] == 0 and m.get("wall_ns", 0) > 0],
+        key=lambda m: m["wall_ns"],
+    )
+    if not iter0_only:
+        return
+
+    # Compute mean wall positions and normalize to T=0 at handshake start.
+    # handshake start = mean position of first checkpoint - its mean duration.
+    first_key = (iter0_only[0]["message_name"], iter0_only[0]["role"],
+                 iter0_only[0].get("direction", "read"))
+    first_mean_wall = np.mean(wall_map[first_key])
+    first_mean_dur = np.mean([m["duration_ns"] for m in rows
+                              if (m["message_name"], m["role"], m.get("direction", "read")) == first_key])
+    t0 = first_mean_wall - first_mean_dur
+
+    # Build checkpoint list in iter 0's chronological order, using mean positions.
+    seen = set()
+    checkpoints = []
+    for m in iter0_only:
+        key = (m["message_name"], m["role"], m.get("direction", "read"))
+        if key in seen:
+            continue
+        seen.add(key)
+        mean_wall = np.mean(wall_map[key])
+        t_us = (mean_wall - t0) / 1000.0
+        short_role = "s" if m["role"] == "server" else "c"
+        label = f"{m['message_name']}_{short_role}"
+        checkpoints.append({
+            "t_us": t_us,
+            "label": label,
+            "role": m["role"],
+            "direction": m.get("direction", "read"),
+            "duration_us": np.mean([x["duration_ns"] for x in rows
+                                    if (x["message_name"], x["role"], x.get("direction", "read")) == key]) / 1000.0,
+        })
+
+    fig, ax = plt.subplots(figsize=(18, 4))
     server_color = sns.color_palette("Blues", 3)[1]
     client_color = sns.color_palette("Oranges", 3)[1]
 
-    left = 0.0
-    for name, role in ordered:
-        us = means[(name, role)] / 1000.0
-        pct = (means[(name, role)] / total_ns) * 100 if total_ns else 0
-        color = server_color if role == "server" else client_color
-        ax.barh(0, us, left=left, height=0.6, color=color, edgecolor="white", linewidth=0.5)
-        if pct >= 2.0:
-            short_role = "s" if role == "server" else "c"
-            ax.text(left + us / 2, 0, f"{name}_{short_role}\n{pct:.1f}%",
-                    ha="center", va="center", fontsize=7, fontweight="bold")
-        left += us
+    # Plot each checkpoint as a vertical line + label.
+    # Alternate label heights within each role to prevent stacking.
+    server_idx = 0
+    client_idx = 0
+    for i, cp in enumerate(checkpoints):
+        color = server_color if cp["role"] == "server" else client_color
+        ax.axvline(cp["t_us"], color=color, alpha=0.6, linewidth=1.5)
+        # Label (rotated) — skip RECORD_READ/RECORD_WRITE for readability.
+        if "RECORD" not in cp["label"]:
+            if cp["role"] == "server":
+                # Alternate between different heights to avoid overlap.
+                offsets = [0.35, 0.6, 0.85]
+                y_offset = offsets[server_idx % len(offsets)]
+                server_idx += 1
+            else:
+                offsets = [-0.35, -0.6, -0.85]
+                y_offset = offsets[client_idx % len(offsets)]
+                client_idx += 1
+            ax.text(cp["t_us"], y_offset, cp["label"],
+                    rotation=45, ha="left", va="bottom" if y_offset > 0 else "top",
+                    fontsize=6, color=color, fontweight="bold")
 
-    ax.set_xlim(0, left)
-    ax.set_yticks([])
-    ax.set_xlabel("Duration (µs)")
+    ax.set_xlim(-5, checkpoints[-1]["t_us"] * 1.05)
+    ax.set_ylim(-1.5, 1.5)
+    ax.set_yticks([0.5, -0.5])
+    ax.set_yticklabels(["server", "client"], fontsize=9)
+    ax.set_xlabel("Time (µs from handshake start)")
     ax.set_title(
         f"{impl} handshake timeline — {meta['cert_type']} / {meta['cpu_model']}\n"
-        f"Blue = server, Orange = client (within-impl profile)",
+        f"Checkpoints at absolute wall-clock positions (blue=server, orange=client)",
         fontsize=11, fontweight="bold",
     )
+    ax.axhline(0, color="gray", linewidth=0.3)
+
+    # End-of-handshake marker (black vertical line at the mean handshake time).
+    mean_key = "s2n_mean_us" if impl == "s2n-tls" else "rustls_mean_us"
+    end_us = meta.get(mean_key, 0)
+    if end_us > 0:
+        ax.axvline(end_us, color="black", linewidth=2, linestyle="--")
+        ax.text(end_us, 0.8, f"END\n{end_us:.0f}µs", ha="center", va="bottom",
+                fontsize=8, fontweight="bold")
+
     plt.tight_layout()
     out_path = output_dir / f"timeline_{meta['cert_type']}.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -222,39 +298,70 @@ def make_timeline_chart(data: dict, impl: str, output_dir: Path):
 
 
 def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
-    """Per-implementation interactive HTML timeline (click a segment -> histogram)."""
+    """Interactive HTML timeline: checkpoints plotted at wall-clock positions.
+    Click a checkpoint to see its duration distribution across iterations."""
+    import json as _json
+
     meta = data["metadata"]
     rows = measurements_for(data, impl)
-    ordered, means, durations = _ordered_segments(rows)
-    if not ordered:
+    if not rows:
         return
 
-    total_ns = sum(means[k] for k in ordered)
-    segments = []
-    for name, role in ordered:
-        mean_us = means[(name, role)] / 1000.0
-        pct = (means[(name, role)] / total_ns) * 100 if total_ns else 0
-        short_role = "s" if role == "server" else "c"
-        segments.append({
-            "label": f"{name}_{short_role}",
-            "name": name, "role": role,
-            "mean_us": mean_us, "pct": pct,
-            "values": [v / 1000.0 for v in durations[(name, role)]],
+    # Get iteration 0 for ordering; use mean wall_ns for positions.
+    iter0 = sorted(
+        [m for m in rows if m["iteration"] == 0 and m.get("wall_ns", 0) > 0],
+        key=lambda m: m["wall_ns"],
+    )
+    if not iter0:
+        return
+
+    # Mean wall positions and durations per checkpoint key.
+    wall_map = defaultdict(list)
+    dur_map = defaultdict(list)
+    for m in rows:
+        if m.get("wall_ns", 0) > 0:
+            key = (m["message_name"], m["role"], m.get("direction", "read"))
+            wall_map[key].append(m["wall_ns"])
+            dur_map[key].append(m["duration_ns"] / 1000.0)
+
+    first_key = (iter0[0]["message_name"], iter0[0]["role"],
+                 iter0[0].get("direction", "read"))
+    first_mean_wall = np.mean(wall_map[first_key])
+    first_mean_dur = np.mean(dur_map[first_key]) * 1000  # back to ns
+    t0 = first_mean_wall - first_mean_dur
+
+    # Build checkpoints in iter 0's order, using mean positions.
+    seen = set()
+    checkpoints = []
+    for m in iter0:
+        key = (m["message_name"], m["role"], m.get("direction", "read"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if "RECORD" in m["message_name"]:
+            continue
+        mean_wall = np.mean(wall_map[key])
+        t_us = (mean_wall - t0) / 1000.0
+        short_role = "s" if m["role"] == "server" else "c"
+        label = f"{m['message_name']}_{short_role}"
+        checkpoints.append({
+            "t_us": round(t_us, 2),
+            "label": label,
+            "role": m["role"],
+            "direction": m.get("direction", "read"),
+            "duration_us": round(np.mean(dur_map[key]), 2),
+            "values": dur_map.get(key, []),
         })
 
-    html = _build_interactive_html(segments, meta, impl)
-    out_path = output_dir / f"timeline_interactive_{meta['cert_type']}.html"
-    out_path.write_text(html)
-    print(f"  ✓ {out_path}")
-
-
-def _build_interactive_html(segments: list, meta: dict, impl: str) -> str:
-    import json as _json
-    segments_json = _json.dumps(segments)
     cert_type = meta["cert_type"]
     cpu_model = meta["cpu_model"]
+    data_json = _json.dumps(checkpoints)
 
-    return f"""<!DOCTYPE html>
+    # End-of-handshake time from metadata.
+    mean_key = "s2n_mean_us" if impl == "s2n-tls" else "rustls_mean_us"
+    end_us = meta.get(mean_key, checkpoints[-1]["t_us"] if checkpoints else 0)
+
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
     <title>{impl} Timeline — {cert_type}</title>
@@ -263,125 +370,103 @@ def _build_interactive_html(segments: list, meta: dict, impl: str) -> str:
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; background: #fafafa; }}
         h2 {{ margin-bottom: 4px; }}
         .subtitle {{ color: #666; font-size: 14px; margin-bottom: 16px; }}
-        #timeline {{ width: 100%; height: 180px; cursor: pointer; }}
-        #histogram {{ width: 100%; height: 350px; }}
+        #timeline {{ width: 100%; height: 300px; cursor: pointer; }}
+        #histogram {{ width: 100%; height: 300px; }}
         .hint {{ color: #888; font-size: 12px; margin-top: 4px; }}
-        .selector {{ margin: 10px 0; font-size: 14px; }}
-        .selector select {{ padding: 4px 8px; font-size: 14px; border-radius: 4px; border: 1px solid #ccc; }}
     </style>
 </head>
 <body>
     <h2>{impl} Handshake Timeline — {cert_type}</h2>
-    <div class="subtitle">{cpu_model} &nbsp;|&nbsp; Blue = server, Orange = client &nbsp;|&nbsp; within-implementation profile</div>
+    <div class="subtitle">{cpu_model} &nbsp;|&nbsp; Checkpoints at wall-clock positions &nbsp;|&nbsp; Click a point to see its duration distribution</div>
     <div id="timeline"></div>
-    <div class="hint">Click a segment above, or pick a message below, to see its distribution.</div>
-    <div class="selector">
-        <label for="msgSelect">Message: </label>
-        <select id="msgSelect"></select>
-    </div>
+    <div class="hint">Blue = server, Orange = client. X-axis = time from handshake start (µs).</div>
     <div id="histogram"></div>
 
     <script>
-    const segments = {segments_json};
+    const checkpoints = {data_json};
     const serverColor = 'rgb(70, 130, 180)';
     const clientColor = 'rgb(230, 140, 60)';
-    const serverColorLight = 'rgba(70, 130, 180, 0.3)';
-    const clientColorLight = 'rgba(230, 140, 60, 0.3)';
 
-    let left = 0;
-    const timelineTraces = segments.map((seg, i) => {{
-        const color = seg.role === 'server' ? serverColor : clientColor;
-        const trace = {{
-            x: [seg.mean_us], y: [''], type: 'bar', orientation: 'h', base: left,
-            marker: {{ color: color, line: {{ color: 'white', width: 0.5 }} }},
-            hovertemplate: '<b>' + seg.label + '</b><br>Mean: ' + seg.mean_us.toFixed(2) + ' µs<br>' + seg.pct.toFixed(1) + '% of handshake<extra></extra>',
-            showlegend: false, name: seg.label,
-        }};
-        left += seg.mean_us;
-        return trace;
-    }});
+    // Split by role for the scatter plot.
+    const serverPts = checkpoints.filter(c => c.role === 'server');
+    const clientPts = checkpoints.filter(c => c.role === 'client');
 
-    const annotations = [];
-    let annotLeft = 0;
-    segments.forEach(seg => {{
-        if (seg.pct >= 2.0) {{
-            annotations.push({{
-                x: annotLeft + seg.mean_us / 2, y: '',
-                text: seg.label + '<br>' + seg.pct.toFixed(1) + '%',
-                showarrow: false, font: {{ size: 9, color: '#333' }},
-                xanchor: 'center', yanchor: 'middle',
-            }});
-        }}
-        annotLeft += seg.mean_us;
-    }});
-
-    const timelineLayout = {{
-        barmode: 'stack',
-        xaxis: {{ title: 'Duration (µs)' }},
-        yaxis: {{ showticklabels: false }},
-        margin: {{ t: 10, b: 40, l: 20, r: 20 }},
-        annotations: annotations, height: 160,
+    const serverTrace = {{
+        x: serverPts.map(c => c.t_us),
+        y: serverPts.map((c, i) => 0),
+        text: serverPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
+        mode: 'markers',
+        type: 'scatter',
+        name: 'server',
+        marker: {{ color: serverColor, size: 12, symbol: 'diamond' }},
+        hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
+    }};
+    const clientTrace = {{
+        x: clientPts.map(c => c.t_us),
+        y: clientPts.map((c, i) => 0),
+        text: clientPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
+        mode: 'markers',
+        type: 'scatter',
+        name: 'client',
+        marker: {{ color: clientColor, size: 12, symbol: 'circle' }},
+        hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
     }};
 
-    Plotly.newPlot('timeline', timelineTraces, timelineLayout, {{responsive: true}});
+    const layout = {{
+        xaxis: {{ title: 'Time from handshake start (µs)' }},
+        yaxis: {{ showticklabels: false, range: [-2, 2], zeroline: false }},
+        margin: {{ t: 20, b: 50, l: 30, r: 20 }},
+        height: 280,
+        showlegend: true,
+        shapes: [{{
+            type: 'line', x0: {end_us}, x1: {end_us}, y0: -4, y1: 4,
+            line: {{ color: 'black', width: 2, dash: 'dash' }}
+        }}],
+        annotations: [{{
+            x: {end_us}, y: 3.5, text: 'END<br>{end_us:.0f}µs',
+            showarrow: false, font: {{ size: 10, color: 'black' }}
+        }}],
+    }};
 
-    const select = document.getElementById('msgSelect');
-    segments.forEach((seg, i) => {{
-        const opt = document.createElement('option');
-        opt.value = i;
-        opt.textContent = seg.label + ' (' + seg.mean_us.toFixed(2) + ' µs, ' + seg.pct.toFixed(1) + '%)';
-        select.appendChild(opt);
-    }});
+    Plotly.newPlot('timeline', [serverTrace, clientTrace], layout, {{responsive: true}});
 
-    let largestIdx = 0, largestMean = 0;
-    segments.forEach((seg, i) => {{ if (seg.mean_us > largestMean) {{ largestMean = seg.mean_us; largestIdx = i; }} }});
-    select.value = largestIdx;
-    showHistogram(largestIdx);
-    highlightSegment(largestIdx);
-
+    // Click handler — show duration distribution for clicked checkpoint.
     document.getElementById('timeline').on('plotly_click', function(eventData) {{
-        const pointIdx = eventData.points[0].curveNumber;
-        select.value = pointIdx;
-        showHistogram(pointIdx);
-        highlightSegment(pointIdx);
+        const pt = eventData.points[0];
+        const traceIdx = pt.curveNumber;
+        const ptIdx = pt.pointIndex;
+        const cp = traceIdx === 0 ? serverPts[ptIdx] : clientPts[ptIdx];
+        showHistogram(cp);
     }});
 
-    select.addEventListener('change', function() {{
-        const idx = parseInt(this.value, 10);
-        showHistogram(idx);
-        highlightSegment(idx);
-    }});
-
-    function showHistogram(idx) {{
-        const seg = segments[idx];
-        const color = seg.role === 'server' ? serverColor : clientColor;
+    function showHistogram(cp) {{
+        const color = cp.role === 'server' ? serverColor : clientColor;
         const trace = {{
-            x: seg.values, type: 'histogram',
+            x: cp.values,
+            type: 'histogram',
             marker: {{ color: color, opacity: 0.8 }},
-            hovertemplate: 'Duration: %{{x:.2f}} µs<br>Count: %{{y}}<extra></extra>',
         }};
         const layout = {{
-            title: {{ text: seg.label + ' — distribution (' + seg.values.length + ' samples, mean ' + seg.mean_us.toFixed(2) + ' µs)', font: {{ size: 14 }} }},
-            xaxis: {{ title: 'Duration (µs)' }}, yaxis: {{ title: 'Count' }},
-            margin: {{ t: 50, b: 50, l: 60, r: 20 }}, height: 340,
+            title: {{ text: cp.label + ' — duration distribution (' + cp.values.length + ' samples)', font: {{ size: 14 }} }},
+            xaxis: {{ title: 'Duration (µs)' }},
+            yaxis: {{ title: 'Count' }},
+            margin: {{ t: 50, b: 50, l: 60, r: 20 }},
+            height: 280,
         }};
         Plotly.react('histogram', [trace], layout, {{responsive: true}});
     }}
 
-    function highlightSegment(activeIdx) {{
-        const colors = segments.map((seg, i) => {{
-            if (i === activeIdx) return seg.role === 'server' ? serverColor : clientColor;
-            return seg.role === 'server' ? serverColorLight : clientColorLight;
-        }});
-        for (let i = 0; i < segments.length; i++) {{
-            Plotly.restyle('timeline', {{ 'marker.color': [colors[i]] }}, [i]);
-        }}
-    }}
+    // Show largest by default.
+    let largest = checkpoints[0];
+    checkpoints.forEach(c => {{ if (c.duration_us > largest.duration_us) largest = c; }});
+    showHistogram(largest);
     </script>
 </body>
 </html>"""
 
-
+    out_path = output_dir / f"timeline_interactive_{meta['cert_type']}.html"
+    out_path.write_text(html)
+    print(f"  ✓ {out_path}")
 def main():
     if len(sys.argv) < 2:
         print("Usage: visualize.py <results.json> [--output-dir <dir>]", file=sys.stderr)

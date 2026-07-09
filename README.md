@@ -103,16 +103,38 @@ python3 analyze_other.py folded_s2n-tls_rsa2048.txt
   "measurements": [
     { "implementation": "s2n-tls" | "rustls", "handshake_type": "tls13_full",
       "iteration": 0, "message_name": "SERVER_CERT_VERIFY",
-      "role": "server", "duration_ns": 295000 }
+      "role": "server", "direction": "write", "duration_ns": 295000 }
   ],
   "reproducibility": {
-    "<impl>|<MESSAGE>_<role>": { "mean_ns": ..., "stddev_ns": ..., "cv_percent": ... }
+    "<impl>|<MESSAGE>_<role>_<direction>": { "mean_ns": ..., "stddev_ns": ..., "cv_percent": ... }
   }
 }
 ```
 
-Reproducibility keys are namespaced by implementation (`s2n-tls|...`,
-`rustls|...`) so the two are never accidentally merged.
+Reproducibility keys are namespaced by implementation AND direction
+(`s2n-tls|SERVER_CERT_VERIFY_server_write`) so the two are never merged and
+read (processing) vs write (producing) costs stay distinct.
+
+## Comparing across implementations (read this before making claims)
+
+Both libraries now emit read + write checkpoints, and both use the same
+handler-local delta rule (cost measured from the preceding `RECORD_READ`, so
+peer-wait is excluded). But they structure their state machines differently, so
+only some buckets are 1:1 comparable:
+
+- **Cleanly 1:1 — `SERVER_CERT_VERIFY` server/write (RSA sign):** both isolate the
+  signature op. This is the headline number. (Measured: s2n ~355 µs vs rustls
+  ~356 µs — identical, as expected on shared aws-lc.)
+- **Compare as a SUM, not per-bucket — client cert path:** s2n puts chain
+  validation in `SERVER_CERT`; rustls bundles it into `SERVER_CERT_VERIFY`. Only
+  `SERVER_CERT + SERVER_CERT_VERIFY` combined is comparable (s2n ~68 µs vs rustls
+  ~53 µs).
+- **NOT comparable per-bucket — Finished, HKDF/key-schedule:** rustls bundles
+  verify+derive+produce into one handler; s2n splits across handlers and
+  transition gaps. Use operation-level (flamegraph) comparison instead.
+
+See the rustls fork's `OPERATION_BUCKET_COMPARISON.md` for the full source-verified
+bucket map.
 
 ## Notes
 
