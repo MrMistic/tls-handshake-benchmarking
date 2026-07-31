@@ -20,20 +20,33 @@ import argparse
 import re
 
 BUCKETS = [
-    ("RSA modexp/bignum", [r"rsaz_amm", r"bn_sqrx", r"bn_sqr8x", r"bn_mulx", r"bn_mul",
-                           r"mulx4x", r"extract_multiplier", r"bn_mod_exp", r"bn_from_montgomery",
-                           r"bn_mont", r"rsa_", r"\brsa\b", r"mod_exp"]),
-    ("ECDSA/EC P-256",    [r"ecp_nistz", r"nistz256", r"p256", r"ecdsa", r"bignum_montinv_p256"]),
-    ("X25519/ECDHE",      [r"25519", r"curve25519", r"x25519"]),
-    ("ML-KEM (Keccak/SHA3)", [r"keccak", r"sha3", r"kyber", r"mlkem", r"ml_kem"]),
-    ("SHA-2 hashing",     [r"sha256_block", r"sha512_block", r"sha1_block", r"sha256", r"sha512", r"md5_block"]),
-    ("HKDF/key schedule", [r"hkdf", r"hmac", r"secrets_update", r"key_schedule", r"derive", r"expand_label", r"tls13_"]),
-    ("AES/GCM/AEAD",      [r"aes", r"gcm", r"aead", r"chacha", r"poly1305", r"ghash"]),
-    ("Cert/X509 validate",[r"x509", r"asn1", r"\bcbs_", r"parse_asn1", r"cache_extensions",
-                           r"verify_cert", r"name_constraints", r"name_canon", r"\bder_", r"webpki"]),
-    ("Buffer mgmt (s2n stuffer/blob)", [r"s2n_stuffer", r"s2n_blob", r"s2n_record_"]),
-    ("RNG",               [r"rdrand", r"rand_bytes", r"drbg", r"ctr_drbg"]),
-    ("alloc/memory",      [r"malloc", r"\bfree\b", r"cfree", r"alloc", r"memcpy", r"memset", r"memmove", r"OPENSSL_free", r"OPENSSL_malloc"]),
+    ("RSA sign/verify", [r"rsaz_amm", r"bn_sqrx", r"bn_sqr8x", r"bn_mulx", r"bn_mul",
+                         r"mulx4x", r"extract_multiplier", r"bn_mod_exp", r"bn_from_montgomery",
+                         r"bn_mont", r"rsa_", r"\brsa\b", r"mod_exp",
+                         r"bn_add", r"bn_sub", r"bn_mod", r"bn_cmp", r"bn_rshift",
+                         r"bn_uadd", r"bn_select", r"BN_div", r"BN_mod_inverse",
+                         r"bn_minimal_width", r"bn_fits_in_words", r"bn_rshift_words",
+                         r"bn_powerx5", r"bn_cmp_words", r"bn_set_minimal_width",
+                         r"bn_wexpand", r"BN_num_bits", r"bn_usub", r"BN_is_odd"]),
+    ("ECDSA/EC P-256",  [r"ecp_nistz", r"nistz256", r"p256", r"ecdsa", r"bignum_montinv_p256"]),
+    ("X25519 key exchange", [r"25519", r"curve25519", r"x25519"]),
+    ("ML-KEM (post-quantum)", [r"keccak", r"sha3", r"kyber", r"mlkem", r"ml_kem",
+                               r"SHAKE", r"KeccakF1600"]),
+    ("Transcript hashing (SHA/MD5)", [r"sha256_block", r"sha512_block", r"sha1_block", r"sha256", r"sha512",
+                                   r"md5_block", r"SHA256", r"SHA512", r"SHA1_",
+                                   r"s2n_hash_", r"s2n_evp_hash", r"EVP_Digest"]),
+    ("Key derivation (HKDF)", [r"hkdf", r"hmac", r"secrets_update", r"key_schedule", r"derive",
+                               r"expand_label", r"tls13_"]),
+    ("AES-GCM encryption", [r"aes", r"gcm", r"aead", r"chacha", r"poly1305", r"ghash"]),
+    ("Certificate validation", [r"x509", r"asn1", r"\bcbs_", r"parse_asn1", r"cache_extensions",
+                                r"verify_cert", r"name_constraints", r"name_canon", r"\bder_", r"webpki"]),
+    ("Buffer serialization (s2n)", [r"s2n_stuffer", r"s2n_blob", r"s2n_record_"]),
+    ("RNG", [r"rdrand", r"rand_bytes", r"drbg", r"ctr_drbg", r"CRYPTO_rdrand",
+                           r"jent_"]),
+    ("Memory alloc/free", [r"malloc", r"\bfree\b", r"cfree", r"alloc", r"memcpy", r"memset", r"memmove",
+                           r"OPENSSL_free", r"OPENSSL_malloc", r"OPENSSL_cleanse",
+                           r"_int_free", r"unlink_chunk", r"__rust.*alloc", r"__rust.*dealloc",
+                           r"tcache_get", r"_int_malloc"]),
 ]
 
 
@@ -73,38 +86,62 @@ def report_counts(report, mean, label):
     counts = bucketize(rows)
     accounted = sum(counts.values())
     print(f"\n=== {label} (DWARF self-time; mean {mean:.1f} us) ===")
-    print(f"  {'Operation':<28} {'self%':>7} {'us/handshake':>13}")
-    print(f"  {'-'*28} {'-'*7} {'-'*13}")
+    print(f"  {'Operation':<32} {'self%':>7} {'us/handshake':>13}")
+    print(f"  {'-'*32} {'-'*7} {'-'*13}")
     for name in [b[0] for b in BUCKETS] + ["other"]:
         pct = counts[name]
         if pct <= 0:
             continue
-        print(f"  {name:<28} {pct:6.1f}% {pct/100*mean:11.1f}")
+        display_name = "Framework overhead" if name == "other" else name
+        print(f"  {display_name:<32} {pct:6.1f}% {pct/100*mean:11.1f}")
     print(f"  (accounted: {accounted:.1f}% of self-time samples)")
     return {name: counts[name] / 100 * mean for name, _ in BUCKETS}, counts["other"] / 100 * mean
 
 
-def make_chart(s2n_us, rustls_us, cert_type, out_path):
+def make_chart(s2n_us, rustls_us, cert_type, out_path, s2n_mean=0, r_mean=0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
 
-    names = [b[0] for b in BUCKETS] + ["other"]
+    names = [b[0] for b in BUCKETS] + ["Framework overhead"]
     names = [n for n in names if s2n_us.get(n, 0) > 0.05 or rustls_us.get(n, 0) > 0.05]
     s = [s2n_us.get(n, 0) for n in names]
     r = [rustls_us.get(n, 0) for n in names]
     y = np.arange(len(names))
     h = 0.38
-    fig, ax = plt.subplots(figsize=(11, 7))
-    ax.barh(y - h / 2, s, h, label="s2n-tls", color="#4682b4", edgecolor="black", linewidth=0.4)
-    ax.barh(y + h / 2, r, h, label="rustls", color="#e68c3c", edgecolor="black", linewidth=0.4)
+    fig, ax = plt.subplots(figsize=(12, max(6, len(names) * 0.7 + 1)))
+    bars_s = ax.barh(y - h / 2, s, h, label="s2n-tls", color="#4682b4", edgecolor="black", linewidth=0.4)
+    bars_r = ax.barh(y + h / 2, r, h, label="rustls", color="#e68c3c", edgecolor="black", linewidth=0.4)
     ax.set_yticks(y)
-    ax.set_yticklabels(names)
+    ax.set_yticklabels(names, fontsize=10)
     ax.invert_yaxis()
-    ax.set_xlabel("µs per handshake (DWARF self-time × hot-loop mean)")
-    ax.set_title(f"Operation-level comparison — {cert_type}\nDWARF self-time (authoritative)")
-    ax.legend()
+    ax.set_xlabel("µs per handshake (self-time)", fontsize=11)
+
+    # Title with key stats
+    s2n_total = sum(s2n_us.values())
+    r_total = sum(rustls_us.values())
+    gap = s2n_total - r_total
+    ax.set_title(
+        f"Operation-level CPU breakdown — TLS 1.3 {cert_type.upper()} handshake\n"
+        f"s2n-tls {s2n_mean:.0f}µs vs rustls {r_mean:.0f}µs "
+        f"(gap: {s2n_mean - r_mean:.0f}µs, {abs(s2n_mean - r_mean)/r_mean*100:.1f}%)",
+        fontsize=12, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=10)
+
+    # Add value labels on bars
+    for bar in bars_s:
+        w = bar.get_width()
+        if w > 5:
+            ax.text(w - 1, bar.get_y() + bar.get_height()/2, f'{w:.0f}',
+                    ha='right', va='center', fontsize=8, color='white', fontweight='bold')
+    for bar in bars_r:
+        w = bar.get_width()
+        if w > 5:
+            ax.text(w - 1, bar.get_y() + bar.get_height()/2, f'{w:.0f}',
+                    ha='right', va='center', fontsize=8, color='white', fontweight='bold')
+
+    ax.grid(axis='x', alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -125,13 +162,13 @@ def main():
     args = ap.parse_args()
 
     us1, other1 = report_counts(args.report, args.mean, args.label)
-    us1["other"] = other1
+    us1["Framework overhead"] = other1
 
     if args.report2 and args.mean2:
         us2, other2 = report_counts(args.report2, args.mean2, args.label2)
-        us2["other"] = other2
+        us2["Framework overhead"] = other2
         if args.chart:
-            make_chart(us1, us2, args.cert_type, args.chart)
+            make_chart(us1, us2, args.cert_type, args.chart, s2n_mean=args.mean, r_mean=args.mean2)
 
 
 if __name__ == "__main__":

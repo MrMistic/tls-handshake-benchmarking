@@ -244,6 +244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.40"
 dependencies = [
@@ -279,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "s2n-tls"
-version = "0.3.39"
+version = "0.3.41"
 dependencies = [
  "errno",
  "hex",
@@ -290,12 +299,19 @@ dependencies = [
 
 [[package]]
 name = "s2n-tls-sys"
-version = "0.3.39"
+version = "0.3.41"
 dependencies = [
  "aws-lc-rs",
  "cc",
  "libc",
+ "rustc_version",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

@@ -22,7 +22,7 @@ Output layout:
     charts/<cert_type>/<implementation>/per_message_*.png
                                         stacked_*.png
                                         timeline_*.png
-                                        timeline_interactive_*.html
+    charts/<cert_type>/timeline_interactive_*.html   (combined, impl dropdown)
 """
 
 import json
@@ -297,15 +297,13 @@ def make_timeline_chart(data: dict, impl: str, output_dir: Path):
     print(f"  ✓ {out_path}")
 
 
-def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
-    """Interactive HTML timeline: checkpoints plotted at wall-clock positions.
-    Click a checkpoint to see its duration distribution across iterations."""
-    import json as _json
-
+def _build_checkpoints(data: dict, impl: str):
+    """Build the checkpoint list (mean wall positions + duration samples)
+    for one implementation. Returns (checkpoints, end_us) or (None, 0)."""
     meta = data["metadata"]
     rows = measurements_for(data, impl)
     if not rows:
-        return
+        return None, 0
 
     # Get iteration 0 for ordering; use mean wall_ns for positions.
     iter0 = sorted(
@@ -313,7 +311,7 @@ def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
         key=lambda m: m["wall_ns"],
     )
     if not iter0:
-        return
+        return None, 0
 
     # Mean wall positions and durations per checkpoint key.
     wall_map = defaultdict(list)
@@ -350,96 +348,225 @@ def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
             "role": m["role"],
             "direction": m.get("direction", "read"),
             "duration_us": round(np.mean(dur_map[key]), 2),
-            "values": dur_map.get(key, []),
+            "values": [round(v, 3) for v in dur_map.get(key, [])],
         })
-
-    cert_type = meta["cert_type"]
-    cpu_model = meta["cpu_model"]
-    data_json = _json.dumps(checkpoints)
 
     # End-of-handshake time from metadata.
     mean_key = "s2n_mean_us" if impl == "s2n-tls" else "rustls_mean_us"
     end_us = meta.get(mean_key, checkpoints[-1]["t_us"] if checkpoints else 0)
+    return checkpoints, end_us
+
+
+def make_interactive_timeline(data: dict, output_dir: Path):
+    """Combined interactive HTML timeline for ALL implementations, with a
+    dropdown to flip between them. Click a checkpoint to see its duration
+    distribution across iterations."""
+    import json as _json
+
+    meta = data["metadata"]
+    impls = implementations(data)
+
+    impl_data = {}
+    for impl in impls:
+        checkpoints, end_us = _build_checkpoints(data, impl)
+        if checkpoints:
+            impl_data[impl] = {"checkpoints": checkpoints, "end_us": round(end_us, 1)}
+
+    if not impl_data:
+        return
+
+    cert_type = meta["cert_type"]
+    cpu_model = meta["cpu_model"]
+    data_json = _json.dumps(impl_data)
+    default_impl = next(iter(impl_data))
+
+    impl_options = "\n".join(
+        f'        <option value="{impl}">{impl}</option>' for impl in impl_data
+    )
+    if len(impl_data) > 1:
+        impl_options += (
+            '\n        <option value="__both__">'
+            "both — overlay (not recommended)</option>"
+        )
 
     html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>{impl} Timeline — {cert_type}</title>
+    <title>Handshake Timeline — {cert_type}</title>
     <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; background: #fafafa; }}
         h2 {{ margin-bottom: 4px; }}
         .subtitle {{ color: #666; font-size: 14px; margin-bottom: 16px; }}
+        .toolbar {{ margin-bottom: 12px; }}
+        .toolbar label {{ font-size: 14px; font-weight: 600; margin-right: 8px; }}
+        .toolbar select {{ font-size: 14px; padding: 4px 8px; }}
         #timeline {{ width: 100%; height: 300px; cursor: pointer; }}
         #histogram {{ width: 100%; height: 300px; }}
         .hint {{ color: #888; font-size: 12px; margin-top: 4px; }}
     </style>
 </head>
 <body>
-    <h2>{impl} Handshake Timeline — {cert_type}</h2>
+    <h2 id="title">Handshake Timeline — {cert_type}</h2>
     <div class="subtitle">{cpu_model} &nbsp;|&nbsp; Checkpoints at wall-clock positions &nbsp;|&nbsp; Click a point to see its duration distribution</div>
+    <div class="toolbar">
+        <label for="implSelect">Implementation:</label>
+        <select id="implSelect">
+{impl_options}
+        </select>
+    </div>
+    <div id="overlay-warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; padding:8px 12px; border-radius:4px; font-size:13px; margin-bottom:8px;">
+        Overlay view: message names do NOT measure the same work in each implementation
+        (different state-machine decompositions). Use for visual timing context only.
+        Don't try to compare individual checkpoint durations across implementations.
+        The operation-level comparison chart is the valid cross-impl view.
+    </div>
     <div id="timeline"></div>
-    <div class="hint">Blue = server, Orange = client. X-axis = time from handshake start (µs).</div>
+    <div class="hint">Blue = server, Orange = client. X-axis = time from handshake start (µs). Per-message timings are intended as within-implementation profiles. Not comparable across implementations.</div>
     <div id="histogram"></div>
 
     <script>
-    const checkpoints = {data_json};
+    const implData = {data_json};
     const serverColor = 'rgb(70, 130, 180)';
     const clientColor = 'rgb(230, 140, 60)';
+    // Per-impl role colors for overlay mode (impl 0 = solid, impl 1 = lighter).
+    const overlayColors = [
+        {{ server: 'rgb(70, 130, 180)', client: 'rgb(230, 140, 60)' }},
+        {{ server: 'rgb(60, 179, 113)', client: 'rgb(186, 85, 211)' }},
+    ];
 
-    // Split by role for the scatter plot.
-    const serverPts = checkpoints.filter(c => c.role === 'server');
-    const clientPts = checkpoints.filter(c => c.role === 'client');
+    // Flat per-trace point lists so the click handler can resolve any
+    // curveNumber back to (checkpoint, impl) in both modes.
+    let tracePoints = [];
 
-    const serverTrace = {{
-        x: serverPts.map(c => c.t_us),
-        y: serverPts.map((c, i) => 0),
-        text: serverPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
-        mode: 'markers',
-        type: 'scatter',
-        name: 'server',
-        marker: {{ color: serverColor, size: 12, symbol: 'diamond' }},
-        hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
-    }};
-    const clientTrace = {{
-        x: clientPts.map(c => c.t_us),
-        y: clientPts.map((c, i) => 0),
-        text: clientPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
-        mode: 'markers',
-        type: 'scatter',
-        name: 'client',
-        marker: {{ color: clientColor, size: 12, symbol: 'circle' }},
-        hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
-    }};
+    function render(sel) {{
+        if (sel === '__both__') {{ renderOverlay(); return; }}
+        document.getElementById('overlay-warning').style.display = 'none';
+        const checkpoints = implData[sel].checkpoints;
+        const endUs = implData[sel].end_us;
+        document.getElementById('title').textContent = sel + ' Handshake Timeline — {cert_type}';
 
-    const layout = {{
-        xaxis: {{ title: 'Time from handshake start (µs)' }},
-        yaxis: {{ showticklabels: false, range: [-2, 2], zeroline: false }},
-        margin: {{ t: 20, b: 50, l: 30, r: 20 }},
-        height: 280,
-        showlegend: true,
-        shapes: [{{
-            type: 'line', x0: {end_us}, x1: {end_us}, y0: -4, y1: 4,
-            line: {{ color: 'black', width: 2, dash: 'dash' }}
-        }}],
-        annotations: [{{
-            x: {end_us}, y: 3.5, text: 'END<br>{end_us:.0f}µs',
-            showarrow: false, font: {{ size: 10, color: 'black' }}
-        }}],
-    }};
+        // Split by role for the scatter plot.
+        const serverPts = checkpoints.filter(c => c.role === 'server');
+        const clientPts = checkpoints.filter(c => c.role === 'client');
+        tracePoints = [
+            {{ impl: sel, pts: serverPts }},
+            {{ impl: sel, pts: clientPts }},
+        ];
 
-    Plotly.newPlot('timeline', [serverTrace, clientTrace], layout, {{responsive: true}});
+        const serverTrace = {{
+            x: serverPts.map(c => c.t_us),
+            y: serverPts.map(() => 0),
+            text: serverPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
+            mode: 'markers',
+            type: 'scatter',
+            name: 'server',
+            marker: {{ color: serverColor, size: 12, symbol: 'diamond' }},
+            hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
+        }};
+        const clientTrace = {{
+            x: clientPts.map(c => c.t_us),
+            y: clientPts.map(() => 0),
+            text: clientPts.map(c => c.label + '<br>dur: ' + c.duration_us + ' µs'),
+            mode: 'markers',
+            type: 'scatter',
+            name: 'client',
+            marker: {{ color: clientColor, size: 12, symbol: 'circle' }},
+            hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
+        }};
 
-    // Click handler — show duration distribution for clicked checkpoint.
-    document.getElementById('timeline').on('plotly_click', function(eventData) {{
-        const pt = eventData.points[0];
-        const traceIdx = pt.curveNumber;
-        const ptIdx = pt.pointIndex;
-        const cp = traceIdx === 0 ? serverPts[ptIdx] : clientPts[ptIdx];
-        showHistogram(cp);
-    }});
+        const layout = {{
+            xaxis: {{ title: 'Time from handshake start (µs)' }},
+            yaxis: {{ showticklabels: false, range: [-2, 2], zeroline: false }},
+            margin: {{ t: 20, b: 50, l: 30, r: 20 }},
+            height: 280,
+            showlegend: true,
+            shapes: [{{
+                type: 'line', x0: endUs, x1: endUs, y0: -4, y1: 4,
+                line: {{ color: 'black', width: 2, dash: 'dash' }}
+            }}],
+            annotations: [{{
+                x: endUs, y: 3.5, text: 'END<br>' + Math.round(endUs) + 'µs',
+                showarrow: false, font: {{ size: 10, color: 'black' }}
+            }}],
+        }};
 
-    function showHistogram(cp) {{
+        Plotly.react('timeline', [serverTrace, clientTrace], layout, {{responsive: true}});
+
+        // Show largest checkpoint's distribution by default.
+        let largest = checkpoints[0];
+        checkpoints.forEach(c => {{ if (c.duration_us > largest.duration_us) largest = c; }});
+        showHistogram(largest, sel);
+    }}
+
+    function renderOverlay() {{
+        document.getElementById('overlay-warning').style.display = 'block';
+        document.getElementById('title').textContent = 'Handshake Timeline (overlay) — {cert_type}';
+
+        const impls = Object.keys(implData);
+        const traces = [];
+        const shapes = [];
+        const annotations = [];
+        tracePoints = [];
+
+        impls.forEach((impl, i) => {{
+            // Each impl gets its own horizontal lane so points don't collide.
+            const lane = impls.length > 1 ? (i === 0 ? 0.7 : -0.7) : 0;
+            const colors = overlayColors[i % overlayColors.length];
+            const checkpoints = implData[impl].checkpoints;
+            const endUs = implData[impl].end_us;
+
+            ['server', 'client'].forEach(role => {{
+                const pts = checkpoints.filter(c => c.role === role);
+                tracePoints.push({{ impl: impl, pts: pts }});
+                traces.push({{
+                    x: pts.map(c => c.t_us),
+                    y: pts.map(() => lane),
+                    text: pts.map(c => impl + ' / ' + c.label + '<br>dur: ' + c.duration_us + ' µs'),
+                    mode: 'markers',
+                    type: 'scatter',
+                    name: impl + ' ' + role,
+                    marker: {{
+                        color: colors[role], size: 11,
+                        symbol: role === 'server' ? 'diamond' : 'circle',
+                    }},
+                    hovertemplate: '%{{text}}<br>T=%{{x:.1f}} µs<extra></extra>',
+                }});
+            }});
+
+            shapes.push({{
+                type: 'line', x0: endUs, x1: endUs, y0: lane - 0.5, y1: lane + 0.5,
+                line: {{ color: colors.server, width: 2, dash: 'dash' }}
+            }});
+            annotations.push({{
+                x: endUs, y: lane + 0.65,
+                text: impl + ' END<br>' + Math.round(endUs) + 'µs',
+                showarrow: false, font: {{ size: 9, color: colors.server }}
+            }});
+            annotations.push({{
+                x: 0, y: lane + 0.45, xanchor: 'left',
+                text: '<b>' + impl + '</b>',
+                showarrow: false, font: {{ size: 11, color: colors.server }}
+            }});
+        }});
+
+        const layout = {{
+            xaxis: {{ title: 'Time from handshake start (µs)' }},
+            yaxis: {{ showticklabels: false, range: [-2, 2], zeroline: false }},
+            margin: {{ t: 20, b: 50, l: 30, r: 20 }},
+            height: 280,
+            showlegend: true,
+            shapes: shapes,
+            annotations: annotations,
+        }};
+
+        Plotly.react('timeline', traces, layout, {{responsive: true}});
+        Plotly.react('histogram', [], {{ height: 280,
+            annotations: [{{ text: 'Click a checkpoint above to see its duration distribution',
+                             showarrow: false, font: {{ size: 13, color: '#888' }} }}] }});
+    }}
+
+    function showHistogram(cp, impl) {{
         const color = cp.role === 'server' ? serverColor : clientColor;
         const trace = {{
             x: cp.values,
@@ -447,7 +574,7 @@ def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
             marker: {{ color: color, opacity: 0.8 }},
         }};
         const layout = {{
-            title: {{ text: cp.label + ' — duration distribution (' + cp.values.length + ' samples)', font: {{ size: 14 }} }},
+            title: {{ text: impl + ' / ' + cp.label + ' — duration distribution (' + cp.values.length + ' samples)', font: {{ size: 14 }} }},
             xaxis: {{ title: 'Duration (µs)' }},
             yaxis: {{ title: 'Count' }},
             margin: {{ t: 50, b: 50, l: 60, r: 20 }},
@@ -456,10 +583,20 @@ def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
         Plotly.react('histogram', [trace], layout, {{responsive: true}});
     }}
 
-    // Show largest by default.
-    let largest = checkpoints[0];
-    checkpoints.forEach(c => {{ if (c.duration_us > largest.duration_us) largest = c; }});
-    showHistogram(largest);
+    const select = document.getElementById('implSelect');
+    select.addEventListener('change', () => render(select.value));
+
+    render('{default_impl}');
+
+    // Click handler — show duration distribution for clicked checkpoint.
+    // (Attached after the first render, once the div is a plotly plot.)
+    // tracePoints[curveNumber] maps back to (impl, checkpoint) in both modes.
+    document.getElementById('timeline').on('plotly_click', function(eventData) {{
+        const pt = eventData.points[0];
+        const entry = tracePoints[pt.curveNumber];
+        if (!entry) return;
+        showHistogram(entry.pts[pt.pointIndex], entry.impl);
+    }});
     </script>
 </body>
 </html>"""
@@ -467,6 +604,8 @@ def make_interactive_timeline(data: dict, impl: str, output_dir: Path):
     out_path = output_dir / f"timeline_interactive_{meta['cert_type']}.html"
     out_path.write_text(html)
     print(f"  ✓ {out_path}")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: visualize.py <results.json> [--output-dir <dir>]", file=sys.stderr)
@@ -499,7 +638,13 @@ def main():
         make_bar_chart(data, impl, impl_dir)
         make_stacked_chart(data, impl, impl_dir)
         make_timeline_chart(data, impl, impl_dir)
-        make_interactive_timeline(data, impl, impl_dir)
+
+    # Single combined interactive timeline (dropdown per implementation)
+    # at the cert level: charts/<cert>/timeline_interactive_<cert>.html
+    cert_dir = output_dir / cert_type
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[combined] -> {cert_dir}/")
+    make_interactive_timeline(data, cert_dir)
 
     print("\nDone.")
 

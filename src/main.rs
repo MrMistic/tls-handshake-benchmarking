@@ -685,6 +685,21 @@ fn build_s2n_configs(
             builder
                 .set_security_policy(&s2n_tls::security::DEFAULT_TLS13)
                 .unwrap();
+        } else {
+            // TLS 1.3-only PQ policy chosen so BOTH s2n optimizations fire:
+            //  * hash-narrowing (skips MD5/SHA-1 hedging) — needs min proto TLS1.3
+            //  * classical key-share reuse — needs ecc_curves[0] to equal the
+            //    first PQ hybrid's classical curve. CloudFront-TLS-1-3-2025 uses
+            //    ecc prefs 20200310 (x25519 first) and hybrid x25519_mlkem768
+            //    (x25519), so reuse fires and no standalone P-256 keygen occurs.
+            //    (CloudFront-Upstream-*-PQ puts secp256r1 first, which breaks
+            //    reuse and adds a P-256 keygen per handshake — do not use it.)
+            builder
+                .set_security_policy(
+                    &s2n_tls::security::Policy::from_version("CloudFront-TLS-1-3-2025")
+                        .unwrap(),
+                )
+                .unwrap();
         }
         builder
             .load_pem(&certs.cert_chain_pem, &certs.key_pem)
@@ -717,6 +732,15 @@ fn build_s2n_configs(
         if no_pq {
             builder
                 .set_security_policy(&s2n_tls::security::DEFAULT_TLS13)
+                .unwrap();
+        } else {
+            // See the server-side comment: CloudFront-TLS-1-3-2025 keeps both
+            // the hash-narrowing and classical key-share reuse optimizations active.
+            builder
+                .set_security_policy(
+                    &s2n_tls::security::Policy::from_version("CloudFront-TLS-1-3-2025")
+                        .unwrap(),
+                )
                 .unwrap();
         }
         builder.trust_pem(&certs.ca_pem).unwrap();
