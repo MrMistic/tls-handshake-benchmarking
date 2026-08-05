@@ -45,6 +45,7 @@ for i in "$IMPL_A" "$IMPL_B"; do
         *) echo "ERROR: unknown impl '$i' (valid: s2n-tls, rustls, openssl)" >&2; exit 1 ;;
     esac
 done
+[ "$IMPL_A" != "$IMPL_B" ] || { echo "ERROR: --impls needs two different implementations" >&2; exit 1; }
 # The per-message track needs checkpoint instrumentation, which only s2n-tls and
 # rustls have; the harness binary always runs that pair together.
 PER_MESSAGE=0
@@ -60,6 +61,14 @@ VERSION="${1:?usage: ./make_version.sh [--no-lto] [--flamegraphs] [--skip-build]
 shift
 CERTS=("$@")
 if [ $# -eq 0 ]; then CERTS=(rsa2048 ecdsa256); fi
+# Validate upfront: an unknown cert type would otherwise fail mid-run (or worse,
+# --dump-certs silently falls back to rsa2048 and mislabels openssl results).
+for cert in "${CERTS[@]}"; do
+    case "$cert" in
+        rsa2048|rsa3072|rsa4096|ecdsa256|ecdsa384) ;;
+        *) echo "ERROR: unknown cert type '$cert' (valid: rsa2048 rsa3072 rsa4096 ecdsa256 ecdsa384)" >&2; exit 1 ;;
+    esac
+done
 
 S2N_DIR="${S2N_DIR:-../s2n-tls}"
 BIN=./target/release/tls-handshake-benchmarking
@@ -68,6 +77,10 @@ OUT="charts_${VERSION}"
 HOTLOOP_SECS=20
 
 command -v perf >/dev/null || { echo "ERROR: perf not on PATH" >&2; exit 1; }
+# Probe that perf can actually record (fresh machines often block it).
+perf record -o "/tmp/perf_probe_$$.data" -- true > /dev/null 2>&1 \
+    || { echo "ERROR: perf cannot record. Try: sudo sysctl kernel.perf_event_paranoid=1 kernel.kptr_restrict=0" >&2; exit 1; }
+rm -f "/tmp/perf_probe_$$.data"
 if [ "$FLAMEGRAPHS" = 1 ]; then
     command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null \
         || { echo "ERROR: --flamegraphs needs stackcollapse-perf.pl + flamegraph.pl on PATH" >&2; exit 1; }
@@ -114,8 +127,11 @@ fi
 
 # Capture one implementation under perf. Each impl has its own workload driver
 # but the same output contract: a [hotloop] line and a hotloop_mean_* sidecar.
+# The sidecar is deleted first and required after, so a crashed hot loop can
+# never silently fall back to a stale mean from an earlier run.
 capture_impl() {
     local impl="$1" cert="$2" data="$3"
+    rm -f "hotloop_mean_${impl}_${cert}.txt"
     case "$impl" in
         s2n-tls|rustls)
             perf record -g --call-graph dwarf -F 999 -o "$data" -- \
@@ -130,6 +146,10 @@ capture_impl() {
                     "$HOTLOOP_SECS" 2>&1 | grep -E '\[hotloop\]|\[config\]' || true
             ;;
     esac
+    [ -s "hotloop_mean_${impl}_${cert}.txt" ] || {
+        echo "ERROR: ${impl} hot loop produced no mean for ${cert} (crashed under perf?)" >&2
+        exit 1
+    }
 }
 
 # ---------------------------------------------------------------- build
@@ -175,9 +195,13 @@ fi
 # ------------------------------------------------------------ provenance
 # Record what was actually measured. A toolchain flip alone moves s2n means ~3%,
 # so "which build was this" has to travel with the results.
+if [ -d "$OUT" ]; then
+    echo "WARNING: ${OUT} already exists; new files overwrite old ones and leftovers from previous runs will mix in" >&2
+fi
 mkdir -p "$OUT"
 s2n_commit=$(git -C "$S2N_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 s2n_branch=$(git -C "$S2N_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+rustls_commit=$(git -C ../rustls rev-parse --short HEAD 2>/dev/null || echo unknown)
 if readelf -p .comment "$BIN" 2>/dev/null | grep -q clang; then
     toolchain="clang+LTO"
 else
@@ -188,6 +212,8 @@ fi
     echo "date:         $(date -Is)"
     echo "impls:        ${IMPL_A} vs ${IMPL_B}"
     echo "s2n:          ${s2n_branch} @ ${s2n_commit}"
+    echo "rustls:       ${rustls_commit}"
+    [ "$needs_openssl" = 1 ] && echo "openssl:      ${OPENSSL_VERSION}"
     echo "toolchain:    ${toolchain}"
     echo "cert_backend: ${S2N_BENCH_CERT_BACKEND:-build default}"
     echo "cpu:          $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
@@ -232,6 +258,11 @@ for cert in "${CERTS[@]}"; do
     perf report -i "$data_a" --stdio --sort symbol > "$rpt_a" 2>/dev/null &
     perf report -i "$data_b" --stdio --sort symbol > "$rpt_b" 2>/dev/null &
     wait
+    # `wait` doesn't propagate background failures; require real content so an
+    # empty report can't flow into the analysis as an all-zero profile.
+    for r in "$rpt_a" "$rpt_b"; do
+        grep -q '%' "$r" || { echo "ERROR: perf report produced no samples in $r" >&2; exit 1; }
+    done
 
     mkdir -p "${OUT}/${cert}"
     python3 analyze_selftime.py \
