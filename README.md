@@ -228,6 +228,12 @@ only, AES-128-GCM-SHA256, X25519MLKEM768, tickets off, chain validation on. It
 prints a `[config]` line on the first handshake so every run self-verifies the
 negotiated parameters, and writes the same `[hotloop]` mean + sidecar file.
 
+The easy path is `./make_version.sh --impls openssl,rustls <folder-name>`: if no
+symbolized OpenSSL is available it downloads and builds one automatically
+(one-time, ~5 min, cached in `~/.cache/bench-openssl-*`; needs curl/wget, perl,
+make, gcc). Set `OPENSSL_DIR` to use your own source tree, or `OPENSSL_VERSION`
+to pin a different release. The manual flow:
+
 ```bash
 # 1. Dump the harness's exact cert chain so the chain shape matches
 ./target/release/tls-handshake-benchmarking --dump-certs rsa2048 /tmp/bench_certs

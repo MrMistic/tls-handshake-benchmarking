@@ -84,8 +84,32 @@ echo "== S2N_BENCH_CERT_BACKEND=${S2N_BENCH_CERT_BACKEND:-<unset: build default>
 
 needs_openssl=0
 [ "$IMPL_A" = openssl ] || [ "$IMPL_B" = openssl ] && needs_openssl=1
-if [ "$needs_openssl" = 1 ] && [ ! -x ./openssl_hotloop ]; then
-    [ -n "${OPENSSL_DIR:-}" ] || { echo "ERROR: openssl needs OPENSSL_DIR set to a symbolized OpenSSL source tree (or a prebuilt ./openssl_hotloop)" >&2; exit 1; }
+OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.5}"
+if [ "$needs_openssl" = 1 ] && [ ! -x ./openssl_hotloop ] && [ -z "${OPENSSL_DIR:-}" ]; then
+    # No symbolized OpenSSL provided: fetch and build one (distro libssl is
+    # stripped, so self-time attribution needs a from-source -g build).
+    OPENSSL_DIR="${HOME}/.cache/bench-openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}"
+    if [ ! -f "${OPENSSL_DIR}/libssl.a" ]; then
+        command -v curl >/dev/null || command -v wget >/dev/null \
+            || { echo "ERROR: need curl or wget to fetch OpenSSL (or set OPENSSL_DIR)" >&2; exit 1; }
+        command -v perl >/dev/null && command -v make >/dev/null && command -v gcc >/dev/null \
+            || { echo "ERROR: building OpenSSL needs perl, make, and gcc (or set OPENSSL_DIR)" >&2; exit 1; }
+        echo "== fetch: OpenSSL ${OPENSSL_VERSION} (one-time, ~5 min build) -> ${OPENSSL_DIR}"
+        mkdir -p "$(dirname "$OPENSSL_DIR")"
+        url="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+        if command -v curl >/dev/null; then
+            curl -fsSL "$url" | tar xz -C "$(dirname "$OPENSSL_DIR")"
+        else
+            wget -qO- "$url" | tar xz -C "$(dirname "$OPENSSL_DIR")"
+        fi
+        (cd "$OPENSSL_DIR" \
+            && ./Configure linux-x86_64 -g no-shared no-tests no-docs no-apps \
+            && make build_generated \
+            && make -j"$(nproc)" libssl.a libcrypto.a) > "/tmp/${VERSION}_openssl_build.log" 2>&1 \
+            || { echo "ERROR: OpenSSL build failed; see /tmp/${VERSION}_openssl_build.log" >&2; exit 1; }
+    else
+        echo "== fetch: using cached OpenSSL at ${OPENSSL_DIR}"
+    fi
 fi
 
 # Capture one implementation under perf. Each impl has its own workload driver
@@ -112,6 +136,10 @@ capture_impl() {
 if [ "$SKIP_BUILD" = 1 ]; then
     echo "== build: skipped (--skip-build); using the existing binary"
     [ -x "$BIN" ] || { echo "ERROR: $BIN does not exist" >&2; exit 1; }
+    if [ "$needs_openssl" = 1 ] && [ ! -x ./openssl_hotloop ]; then
+        echo "ERROR: --skip-build with openssl needs a prebuilt ./openssl_hotloop" >&2
+        exit 1
+    fi
 else
     # The sys crate compiles VENDORED copies of the s2n C sources, so re-vendor
     # first or the build silently measures stale code.
