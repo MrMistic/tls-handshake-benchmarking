@@ -2,11 +2,7 @@
 """
 Operation-level analysis from DWARF self-time (trustworthy).
 
-Unlike analyze_fg.py (which buckets folded FP stacks and counts a stack if ANY
-frame matches — unreliable because frame-pointer unwinding breaks through
-aws-lc's hand-written crypto assembly), this reads `perf report --sort symbol`
-SELF time. Self-time is the instruction-pointer leaf and does NOT depend on
-unwinding, so it is correct even when call chains are broken.
+This reads `perf report --sort symbol` and uses SELF time, the instruction-pointer leaf.
 
 Input: the text output of
     perf report -i <data.dwarf> --stdio --sort symbol
@@ -29,9 +25,14 @@ BUCKETS = [
                          r"bn_powerx5", r"bn_cmp_words", r"bn_set_minimal_width",
                          r"bn_wexpand", r"BN_num_bits", r"bn_usub", r"BN_is_odd"]),
     ("ECDSA/EC P-256",  [r"ecp_nistz", r"nistz256", r"p256", r"ecdsa", r"bignum_montinv_p256"]),
-    ("X25519 key exchange", [r"25519", r"curve25519", r"x25519"]),
+    # fe_* = OpenSSL curve25519 field-element internals (no aws-lc collisions)
+    ("X25519 key exchange", [r"25519", r"curve25519", r"x25519", r"\bfe_"]),
+    # scalar_ntt/matrix_expand/etc = OpenSSL ML-KEM internals (crypto/ml_kem)
     ("ML-KEM (post-quantum)", [r"keccak", r"sha3", r"kyber", r"mlkem", r"ml_kem",
-                               r"SHAKE", r"KeccakF1600"]),
+                               r"SHAKE", r"KeccakF1600",
+                               r"scalar_ntt", r"inverse_ntt", r"matrix_expand",
+                               r"encrypt_cpa", r"\bdecap\b", r"\bcmov\b",
+                               r"scalar_encode", r"scalar_decode"]),
     ("Transcript hashing (SHA/MD5)", [r"sha256_block", r"sha512_block", r"sha1_block", r"sha256", r"sha512",
                                    r"md5_block", r"SHA256", r"SHA512", r"SHA1_",
                                    r"s2n_hash_", r"s2n_evp_hash", r"EVP_Digest"]),
@@ -98,7 +99,8 @@ def report_counts(report, mean, label):
     return {name: counts[name] / 100 * mean for name, _ in BUCKETS}, counts["other"] / 100 * mean
 
 
-def make_chart(s2n_us, rustls_us, cert_type, out_path, s2n_mean=0, r_mean=0):
+def make_chart(s2n_us, rustls_us, cert_type, out_path, s2n_mean=0, r_mean=0,
+               label1="s2n-tls", label2="rustls"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -111,20 +113,16 @@ def make_chart(s2n_us, rustls_us, cert_type, out_path, s2n_mean=0, r_mean=0):
     y = np.arange(len(names))
     h = 0.38
     fig, ax = plt.subplots(figsize=(12, max(6, len(names) * 0.7 + 1)))
-    bars_s = ax.barh(y - h / 2, s, h, label="s2n-tls", color="#4682b4", edgecolor="black", linewidth=0.4)
-    bars_r = ax.barh(y + h / 2, r, h, label="rustls", color="#e68c3c", edgecolor="black", linewidth=0.4)
+    bars_s = ax.barh(y - h / 2, s, h, label=label1, color="#4682b4", edgecolor="black", linewidth=0.4)
+    bars_r = ax.barh(y + h / 2, r, h, label=label2, color="#e68c3c", edgecolor="black", linewidth=0.4)
     ax.set_yticks(y)
     ax.set_yticklabels(names, fontsize=10)
     ax.invert_yaxis()
     ax.set_xlabel("µs per handshake (self-time)", fontsize=11)
 
-    # Title with key stats
-    s2n_total = sum(s2n_us.values())
-    r_total = sum(rustls_us.values())
-    gap = s2n_total - r_total
     ax.set_title(
         f"Operation-level CPU breakdown — TLS 1.3 {cert_type.upper()} handshake\n"
-        f"s2n-tls {s2n_mean:.0f}µs vs rustls {r_mean:.0f}µs "
+        f"{label1} {s2n_mean:.0f}µs vs {label2} {r_mean:.0f}µs "
         f"(gap: {s2n_mean - r_mean:.0f}µs, {abs(s2n_mean - r_mean)/r_mean*100:.1f}%)",
         fontsize=12, fontweight='bold')
     ax.legend(loc='lower right', fontsize=10)
@@ -168,7 +166,8 @@ def main():
         us2, other2 = report_counts(args.report2, args.mean2, args.label2)
         us2["Framework overhead"] = other2
         if args.chart:
-            make_chart(us1, us2, args.cert_type, args.chart, s2n_mean=args.mean, r_mean=args.mean2)
+            make_chart(us1, us2, args.cert_type, args.chart, s2n_mean=args.mean, r_mean=args.mean2,
+                       label1=args.label, label2=args.label2)
 
 
 if __name__ == "__main__":

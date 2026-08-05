@@ -686,14 +686,11 @@ fn build_s2n_configs(
                 .set_security_policy(&s2n_tls::security::DEFAULT_TLS13)
                 .unwrap();
         } else {
-            // TLS 1.3-only PQ policy chosen so BOTH s2n optimizations fire:
-            //  * hash-narrowing (skips MD5/SHA-1 hedging) — needs min proto TLS1.3
-            //  * classical key-share reuse — needs ecc_curves[0] to equal the
-            //    first PQ hybrid's classical curve. CloudFront-TLS-1-3-2025 uses
-            //    ecc prefs 20200310 (x25519 first) and hybrid x25519_mlkem768
-            //    (x25519), so reuse fires and no standalone P-256 keygen occurs.
-            //    (CloudFront-Upstream-*-PQ puts secp256r1 first, which breaks
-            //    reuse and adds a P-256 keygen per handshake — do not use it.)
+            // TLS 1.3-only PQ policy with x25519 first in its ecc preferences,
+            // so both hash-narrowing (needs min proto TLS1.3) and classical
+            // key-share reuse (needs ecc_curves[0] == the hybrid's classical
+            // curve) fire. Policies with secp256r1 first (e.g.
+            // CloudFront-Upstream-*-PQ) disable reuse and add a P-256 keygen.
             builder
                 .set_security_policy(
                     &s2n_tls::security::Policy::from_version("CloudFront-TLS-1-3-2025")
@@ -880,8 +877,8 @@ fn run_hotloop(impl_name: &str, sig_type: &str, duration_secs: u64) {
          elapsed_s={:.3} mean_us={mean_us:.3}",
         elapsed.as_secs_f64()
     );
-    // Also write the mean to a sidecar file so the --compare driver (which runs
-    // this under perf and can't easily scrape stderr) can read it back.
+    // Also write the mean to a sidecar file so callers running this under perf
+    // (e.g. make_version.sh) can read it back without scraping stderr.
     let sidecar = format!("hotloop_mean_{impl_name}_{sig_type}.txt");
     let _ = std::fs::write(&sidecar, format!("{mean_us:.3}"));
 }
@@ -907,8 +904,7 @@ fn check_perf_tools() {
 }
 
 /// Record one implementation under perf, render its SVG, fold its stacks, and
-/// return (folded_stacks_path, hot_loop_mean_us). Shared by --flamegraph and
-/// --compare so the mean is captured automatically (no manual copy from stderr).
+/// return (folded_stacks_path, hot_loop_mean_us).
 fn record_and_fold(impl_name: &str, sig_type: &str, duration_secs: u64) -> (String, f64) {
     use std::process::Command;
 
@@ -930,7 +926,7 @@ fn record_and_fold(impl_name: &str, sig_type: &str, duration_secs: u64) -> (Stri
         std::process::exit(1);
     }
 
-    // perf script -> folded stacks file (kept for analyze_fg.py).
+    // perf script -> folded stacks file (input to flamegraph.pl).
     println!("Folding stacks -> {folded_out} ...");
     let perf_script = Command::new("perf")
         .args(["script", "-i", &perf_data])
@@ -979,63 +975,6 @@ fn run_flamegraph(impl_name: &str, sig_type: &str) {
     println!("Done: flamegraph_{impl_name}_{sig_type}.svg");
     println!("  folded stacks: {folded}");
     println!("  hot-loop mean: {mean_us:.1} us");
-}
-
-/// Driver for `--compare`: run the FULL operation-level cross-implementation
-/// analysis end to end with one command. Records both implementations under
-/// perf, folds both, captures each hot-loop mean automatically, and shells out
-/// to analyze_fg.py to produce the operation comparison table + chart.
-fn run_compare(sig_type: &str) {
-    use std::process::Command;
-
-    check_perf_tools();
-
-    // Locate analyze_fg.py next to the manifest (repo root).
-    let script = format!("{}/analyze_fg.py", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&script).exists() {
-        eprintln!("ERROR: analyze_fg.py not found at {script}");
-        std::process::exit(1);
-    }
-    // python3 must be present.
-    let have_py = Command::new("which")
-        .arg("python3")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !have_py {
-        eprintln!("ERROR: python3 not found on PATH (needed for analyze_fg.py).");
-        std::process::exit(1);
-    }
-
-    println!("=== Operation-level comparison: {sig_type} ===\n");
-    let (s2n_folded, s2n_mean) = record_and_fold("s2n-tls", sig_type, 20);
-    println!();
-    let (rustls_folded, rustls_mean) = record_and_fold("rustls", sig_type, 20);
-
-    if s2n_mean == 0.0 || rustls_mean == 0.0 {
-        eprintln!("ERROR: could not read hot-loop mean(s); aborting analysis.");
-        std::process::exit(1);
-    }
-
-    let chart = format!("charts/{sig_type}/operation_comparison_{sig_type}.png");
-    // Ensure the chart dir exists.
-    if let Some(parent) = std::path::Path::new(&chart).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    println!("\nRunning operation-level analysis (means: s2n {s2n_mean:.1}us, rustls {rustls_mean:.1}us)...\n");
-    let status = Command::new("python3")
-        .arg(&script)
-        .args(["--s2n", &s2n_folded, "--s2n-mean", &format!("{s2n_mean:.3}")])
-        .args(["--rustls", &rustls_folded, "--rustls-mean", &format!("{rustls_mean:.3}")])
-        .args(["--cert-type", sig_type, "--chart", &chart])
-        .status()
-        .expect("failed to launch analyze_fg.py");
-    if !status.success() {
-        eprintln!("ERROR: analyze_fg.py failed.");
-        std::process::exit(1);
-    }
-    println!("\nDone. Comparison chart: {chart}");
 }
 
 // ============================================================================
@@ -1139,14 +1078,23 @@ fn main() {
         run_microbench(sig_type);
         return;
     }
-    if let Some(pos) = args.iter().position(|a| a == "--microbench") {
+    // --dump-certs <cert_type> <dir>: write the generated PEMs to disk so
+    // external workload generators (e.g. openssl_hotloop.c) can use the same
+    // cert chain as the harness.
+    if let Some(pos) = args.iter().position(|a| a == "--dump-certs") {
         let sig_type = args.get(pos + 1).map(String::as_str).unwrap_or("rsa2048");
-        run_microbench(sig_type);
-        return;
-    }
-    if let Some(pos) = args.iter().position(|a| a == "--compare") {
-        let sig_type = args.get(pos + 1).map(String::as_str).unwrap_or("rsa2048");
-        run_compare(sig_type);
+        let dir = args.get(pos + 2).map(String::as_str).unwrap_or(".");
+        let certs = generate_certs(sig_type);
+        std::fs::create_dir_all(dir).expect("cannot create cert dump dir");
+        for (name, bytes) in [
+            ("chain.pem", &certs.cert_chain_pem),
+            ("key.pem", &certs.key_pem),
+            ("ca.pem", &certs.ca_pem),
+        ] {
+            let path = format!("{dir}/{sig_type}_{name}");
+            std::fs::write(&path, bytes).expect("cannot write cert dump");
+            println!("wrote {path}");
+        }
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--flamegraph") {
