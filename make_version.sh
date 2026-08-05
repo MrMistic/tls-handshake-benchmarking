@@ -1,49 +1,18 @@
 #!/usr/bin/env bash
-# Build the harness against the current ../s2n-tls checkout, then generate a
-# complete charts_<version> folder: per-message charts + interactive HTML +
-# operation-level comparison, for one or more cert types.
+# Build the harness against the ../s2n-tls checkout (override: S2N_DIR), then
+# generate a complete charts_<folder-name> folder. Flag details: see README.
 #
-# Usage:
-#   ./make_version.sh v13                    # rsa2048 + ecdsa256 (default)
-#   ./make_version.sh v13 rsa2048            # one cert type only
-#   ./make_version.sh --no-lto v13           # GCC build, for bucket attribution
-#   ./make_version.sh --flamegraphs v13      # also render flamegraph SVGs
-#   ./make_version.sh --skip-build v13       # reuse the existing binary as-is
-#   ./make_version.sh --impls openssl,rustls v13    # compare other libraries
-#   ./make_version.sh --full v13             # also mtls/resumed/no-pq variants
+# Usage: ./make_version.sh [flags] <folder-name> [cert_type ...]
+#   default cert types: rsa2048 ecdsa256
+#   --no-lto        GCC build, no LTO (for trustworthy bucket attribution)
+#   --flamegraphs   also render SVGs (needs FlameGraph scripts on PATH)
+#   --skip-build    reuse the existing binary as-is
+#   --impls a,b     implementations to compare (default s2n-tls,rustls;
+#                   openssl pairings are operation-level only, need OPENSSL_DIR)
+#   --full          also run mtls/resumed/no-pq variants (per-message only)
 #
-# --impls picks which two implementations to compare (default s2n-tls,rustls).
-# Valid: s2n-tls | rustls | openssl. The per-message track only exists for
-# s2n-tls and rustls (OpenSSL has no checkpoint instrumentation), so any pairing
-# involving openssl produces the operation-level comparison only.
-# openssl needs a symbolized build; point OPENSSL_DIR at an OpenSSL source tree
-# configured with -g (see README) and the script compiles openssl_hotloop.c
-# against it.
-#
-# --full additionally benchmarks the mtls, resumed, and no-pq handshake
-# variants into charts_<version>/<variant>/. Variants are per-message only
-# (the hot loop only runs full handshakes, so no operation charts) and need
-# the s2n-tls,rustls pairing. Adds ~4 min per variant per cert type.
-#
-# --no-lto forces the GCC (no-LTO) build. Default is clang+LTO, which is the
-# shipping configuration and the right choice for headline totals — but LTO
-# inlines s2n's small functions away, so use --no-lto when you need trustworthy
-# per-bucket attribution (see README "LTO and attribution").
-#
-# --flamegraphs additionally builds the frame-pointer profile and renders
-# browsable SVGs per impl (two extra 20 s captures per cert type). Needs the
-# FlameGraph scripts on PATH: https://github.com/brendangregg/FlameGraph
-# DWARF cannot unwind through aws-lc's assembly, hence the separate FP build.
-#
-# Environment:
-#   S2N_BENCH_CERT_BACKEND=zero_copy|libcrypto|differential   (optional) cert
-#       verify backend for the s2n side. Unset = the build's default. Applies
-#       to both the message-timing run and the perf capture, so the whole
-#       version is consistent.
-#   S2N_DIR=../s2n-tls   (optional) s2n checkout to build against.
-#
-# Prerequisites: perf on PATH; python3 with matplotlib/numpy/pandas/seaborn.
-# Runtime: ~20 min per cert type (perf report on DWARF data is the slow part).
+# Env: S2N_BENCH_CERT_BACKEND=zero_copy|libcrypto|differential (default: build's)
+# Runtime: ~20 min per cert type; perf report on DWARF data is the slow part.
 set -euo pipefail
 
 FLAMEGRAPHS=0
@@ -87,7 +56,7 @@ if [ "$FULL" = 1 ] && [ "$PER_MESSAGE" = 0 ]; then
     exit 1
 fi
 
-VERSION="${1:?usage: ./make_version.sh [--no-lto] [--flamegraphs] [--skip-build] <version> [cert_type ...]}"
+VERSION="${1:?usage: ./make_version.sh [--no-lto] [--flamegraphs] [--skip-build] [--full] [--impls a,b] <version> [cert_type ...]}"
 shift
 CERTS=("$@")
 if [ $# -eq 0 ]; then CERTS=(rsa2048 ecdsa256); fi
@@ -102,6 +71,11 @@ command -v perf >/dev/null || { echo "ERROR: perf not on PATH" >&2; exit 1; }
 if [ "$FLAMEGRAPHS" = 1 ]; then
     command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null \
         || { echo "ERROR: --flamegraphs needs stackcollapse-perf.pl + flamegraph.pl on PATH" >&2; exit 1; }
+    # With --skip-build nothing will produce the FP binary, so require it upfront.
+    if [ "$SKIP_BUILD" = 1 ] && [ ! -x "$FG_BIN" ]; then
+        echo "ERROR: --flamegraphs with --skip-build needs an existing $FG_BIN (see header for the bench-fg build)" >&2
+        exit 1
+    fi
 fi
 
 echo "== Version: ${VERSION}  cert types: ${CERTS[*]}"
@@ -114,8 +88,8 @@ if [ "$needs_openssl" = 1 ] && [ ! -x ./openssl_hotloop ]; then
     [ -n "${OPENSSL_DIR:-}" ] || { echo "ERROR: openssl needs OPENSSL_DIR set to a symbolized OpenSSL source tree (or a prebuilt ./openssl_hotloop)" >&2; exit 1; }
 fi
 
-# Capture one implementation under perf and echo the path of its hot-loop mean
-# sidecar. Each impl has its own workload driver but the same output contract.
+# Capture one implementation under perf. Each impl has its own workload driver
+# but the same output contract: a [hotloop] line and a hotloop_mean_* sidecar.
 capture_impl() {
     local impl="$1" cert="$2" data="$3"
     case "$impl" in
