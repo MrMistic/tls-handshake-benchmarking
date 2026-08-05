@@ -60,16 +60,22 @@ interactive HTML, and the operation-level comparison, for both cert types.
 ./make_version.sh --no-lto <folder-name>   # GCC build (see "LTO and attribution")
 ./make_version.sh --flamegraphs <folder-name>
 ./make_version.sh --skip-build <folder-name>   # reuse the binary already in target/
+./make_version.sh --impls a,b <folder-name>   # defaults to s2n-tls,rustls;
+                          # non-default pairings are operation-level only
+# options are s2n-tls, rustls, openssl, and boringssl(coming soon)
 
+./make_version.sh --full <folder-name> # generates additional folders for mtls, resumed, and no-pq handshakes.
 # force a non-default cert-verify backend (e.g. a libcrypto A/B baseline):
 S2N_BENCH_CERT_BACKEND=libcrypto ./make_version.sh <folder-name>-baseline
 ```
 
 Each run writes `charts_v<N>/provenance.txt` recording the s2n branch/commit,
 toolchain (clang+LTO vs GCC), cert backend, and CPU. so a folder's numbers stay
-interpretable later. Keep one version folder per s2n build so runs never mix.
+interpretable later. Keep one version folder per build so runs never mix.
 
-### 1. Per-message timing (both impls, JSON + charts)
+Each run takes a while, about 30 minutes. just run the one-liner and work on something else while it goes.
+
+### 1. Per-message timing (both impls, JSON + charts) (make_version.sh does this for you)
 
 ```bash
 # Runs s2n-tls AND rustls, writes combined JSON. Cert types:

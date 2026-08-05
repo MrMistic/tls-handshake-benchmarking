@@ -10,6 +10,7 @@
 #   ./make_version.sh --flamegraphs v13      # also render flamegraph SVGs
 #   ./make_version.sh --skip-build v13       # reuse the existing binary as-is
 #   ./make_version.sh --impls openssl,rustls v13    # compare other libraries
+#   ./make_version.sh --full v13             # also mtls/resumed/no-pq variants
 #
 # --impls picks which two implementations to compare (default s2n-tls,rustls).
 # Valid: s2n-tls | rustls | openssl. The per-message track only exists for
@@ -18,6 +19,11 @@
 # openssl needs a symbolized build; point OPENSSL_DIR at an OpenSSL source tree
 # configured with -g (see README) and the script compiles openssl_hotloop.c
 # against it.
+#
+# --full additionally benchmarks the mtls, resumed, and no-pq handshake
+# variants into charts_<version>/<variant>/. Variants are per-message only
+# (the hot loop only runs full handshakes, so no operation charts) and need
+# the s2n-tls,rustls pairing. Adds ~4 min per variant per cert type.
 #
 # --no-lto forces the GCC (no-LTO) build. Default is clang+LTO, which is the
 # shipping configuration and the right choice for headline totals — but LTO
@@ -43,6 +49,7 @@ set -euo pipefail
 FLAMEGRAPHS=0
 NO_LTO=0
 SKIP_BUILD=0
+FULL=0
 IMPLS="s2n-tls,rustls"
 ARGS=()
 while [ $# -gt 0 ]; do
@@ -50,6 +57,7 @@ while [ $# -gt 0 ]; do
         --flamegraphs) FLAMEGRAPHS=1 ;;
         --no-lto)      NO_LTO=1 ;;
         --skip-build)  SKIP_BUILD=1 ;;
+        --full)        FULL=1 ;;
         --impls)       IMPLS="${2:?--impls needs a value, e.g. openssl,rustls}"; shift ;;
         --impls=*)     IMPLS="${1#--impls=}" ;;
         -*) echo "ERROR: unknown flag $1" >&2; exit 1 ;;
@@ -73,6 +81,10 @@ done
 PER_MESSAGE=0
 if [ "$IMPL_A,$IMPL_B" = "s2n-tls,rustls" ] || [ "$IMPL_A,$IMPL_B" = "rustls,s2n-tls" ]; then
     PER_MESSAGE=1
+fi
+if [ "$FULL" = 1 ] && [ "$PER_MESSAGE" = 0 ]; then
+    echo "ERROR: --full variants are per-message only and need the s2n-tls,rustls pairing" >&2
+    exit 1
 fi
 
 VERSION="${1:?usage: ./make_version.sh [--no-lto] [--flamegraphs] [--skip-build] <version> [cert_type ...]}"
@@ -236,6 +248,19 @@ for cert in "${CERTS[@]}"; do
             "$FG_BIN" --flamegraph "$name" "$cert" > /dev/null 2>&1
             mv "flamegraph_${name}_${cert}.svg" "${OUT}/${cert}/"
             echo "   ✓ ${OUT}/${cert}/flamegraph_${name}_${cert}.svg"
+        done
+    fi
+
+    if [ "$FULL" = 1 ]; then
+        # Handshake variants: per-message charts only (see header). Each gets
+        # its own subfolder because visualize.py names outputs by cert type,
+        # which is the same across variants.
+        for variant in mtls resumed no-pq; do
+            vdir="${variant//-/_}"   # no-pq -> no_pq (folder-friendly)
+            vresults="results_${VERSION}_${cert}_${vdir}.json"
+            echo "== [$cert] variant '${variant}': message-timing -> ${vresults}"
+            "$BIN" "--${variant}" "$cert" "$vresults" > /dev/null
+            python3 visualize/visualize.py "$vresults" --output-dir "./${OUT}/${vdir}"
         done
     fi
 done
